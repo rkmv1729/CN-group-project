@@ -135,23 +135,8 @@ async def ws_packets(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/telnet")
 async def ws_telnet(websocket: WebSocket) -> None:
-    """Telnet interactive session WebSocket (stub).
-
-    TODO (Roll 14):
-        - Accept the connection and bridge it to the Telnet server's
-          virtual terminal session.
-        - Forward keystrokes from the browser to the Telnet session and
-          push terminal output back over the WebSocket.
-    """
-    await websocket.accept()
-    try:
-        await websocket.send_json(
-            {"status": "not_implemented", "message": "Telnet WebSocket not yet integrated (Roll 14)"}
-        )
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        pass
+    from telnet.bridge import bridge_ws_to_telnet
+    await bridge_ws_to_telnet(websocket, pkt_logger)
 
 
 # ---------------------------------------------------------------------------

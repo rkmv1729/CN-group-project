@@ -1,37 +1,730 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Protocol Visualizer — Group 3</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: #0f172a;
-            color: #e2e8f0;
-        }
-        .container {
-            text-align: center;
-        }
-        h1 {
-            font-size: 2.5rem;
-            margin-bottom: 0.5rem;
-        }
-        p {
-            font-size: 1.2rem;
-            color: #94a3b8;
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Protocol Visualizer — Group 3 (BOOTP · DNS · TELNET)</title>
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- xterm.js & Fit Addon CDN (for RFC 854 Telnet Web Terminal) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
+  <!-- Custom Styles -->
+  <link rel="stylesheet" href="css/styles.css" />
 </head>
-<body>
-    <div class="container">
-        <h1>Protocol Visualizer</h1>
-        <p>Coming Soon (Roll 27)</p>
+<body class="bg-[#0b1120] text-slate-100 min-h-screen flex flex-col selection:bg-sky-500 selection:text-white">
+
+  <!-- Top Navigation & Live Telemetry Bar -->
+  <header class="sticky top-0 z-30 bg-slate-950/90 backdrop-blur border-b border-slate-800/80 px-4 lg:px-8 py-3">
+    <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+      <!-- Brand Identity -->
+      <div class="flex items-center gap-3">
+        <img src="assets/favicon.svg" alt="Group 3 Logo" class="w-9 h-9 rounded-lg shadow" />
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">
+              Group 3 — Protocol Visualizer
+            </h1>
+            <span class="hidden sm:inline-block px-2 py-0.5 text-[10px] font-mono font-semibold rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
+              Roll 08 · 11 · 14 · 27
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 font-mono">
+            BOOTP (RFC 951 · UDP 10067) · DNS (RFC 1035 · UDP 10053) · TELNET (RFC 854 · TCP 2323)
+          </p>
+        </div>
+      </div>
+
+      <!-- Live WebSocket Stream Status & Global Actions -->
+      <div class="flex flex-wrap items-center gap-2.5">
+        <div class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800">
+          <span id="ws-status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 status-dot-live"></span>
+          <span id="ws-status-text" class="text-xs font-mono font-semibold text-emerald-300">WS Connecting...</span>
+          <button id="ws-reconnect-btn" title="Reconnect WebSocket (/ws/packets)"
+                  class="text-[11px] font-mono text-slate-400 hover:text-white ml-1">↻</button>
+        </div>
+
+        <button id="load-demo-exchange-btn"
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white shadow transition">
+          ⚡ Load Full Demo Exchange
+        </button>
+
+        <button id="export-pcap-btn"
+                class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+          ⬇ Export .pcap
+        </button>
+
+        <button id="theme-toggle-btn"
+                class="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition">
+          ☀️ Light Mode
+        </button>
+      </div>
     </div>
+
+    <!-- Navigation Tabs -->
+    <nav class="max-w-7xl mx-auto mt-3 flex items-center gap-1.5 overflow-x-auto pb-1">
+      <button data-nav-tab="dashboard"
+              class="nav-tab active px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        📊 1. Dashboard & Live Logs
+      </button>
+      <button data-nav-tab="visualizer"
+              class="nav-tab px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        🔄 2. Packet Flow Sequence
+      </button>
+      <button data-nav-tab="decoder"
+              class="nav-tab px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        🧬 3. Bit-Level Header Decoder
+      </button>
+      <button data-nav-tab="bootp"
+              class="nav-tab px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        🟦 4. BOOTP Simulator (RFC 951)
+      </button>
+      <button data-nav-tab="dns"
+              class="nav-tab px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        🟩 5. DNS Query & Zone Studio (RFC 1035)
+      </button>
+      <button data-nav-tab="telnet"
+              class="nav-tab px-3.5 py-1.5 rounded-lg text-xs font-semibold border border-transparent text-slate-300 hover:text-white whitespace-nowrap">
+        🟧 6. Telnet Terminal & IAC (RFC 854)
+      </button>
+    </nav>
+  </header>
+
+  <!-- Main Workspace Container -->
+  <main class="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-8 py-6 space-y-6">
+
+    <!-- ===================================================================
+         VIEW 1: DASHBOARD (Protocol Cards, Quick Controls, Live Packet Log)
+         =================================================================== -->
+    <section data-tab-panel="dashboard" class="space-y-6">
+      <!-- Top Metrics Row -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-4">
+          <div class="text-xs font-mono uppercase text-slate-400">Total Captured Packets</div>
+          <div id="stat-total-packets" class="text-2xl font-bold font-mono text-white mt-1">0</div>
+          <div class="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden flex mt-2.5">
+            <div id="dist-bar-bootp" class="bg-blue-500 h-full transition-all" style="width: 34%"></div>
+            <div id="dist-bar-dns" class="bg-emerald-500 h-full transition-all" style="width: 33%"></div>
+            <div id="dist-bar-telnet" class="bg-amber-500 h-full transition-all" style="width: 33%"></div>
+          </div>
+        </div>
+
+        <div class="theme-surface bg-slate-900/90 border border-blue-500/30 rounded-xl p-4">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono uppercase text-blue-400">BOOTP Packets (Network)</span>
+            <span class="text-[11px] font-mono text-slate-400">UDP :10067/:10068</span>
+          </div>
+          <div id="stat-bootp-packets" class="text-2xl font-bold font-mono text-blue-300 mt-1">0</div>
+          <div class="text-[11px] text-slate-400 mt-1">300-Byte Fixed Header · RFC 951</div>
+        </div>
+
+        <div class="theme-surface bg-slate-900/90 border border-emerald-500/30 rounded-xl p-4">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono uppercase text-emerald-400">DNS Packets (Transport)</span>
+            <span class="text-[11px] font-mono text-slate-400">UDP :10053</span>
+          </div>
+          <div id="stat-dns-packets" class="text-2xl font-bold font-mono text-emerald-300 mt-1">0</div>
+          <div class="text-[11px] text-slate-400 mt-1">12-Byte Header + 0xC0 Pointers · RFC 1035</div>
+        </div>
+
+        <div class="theme-surface bg-slate-900/90 border border-amber-500/30 rounded-xl p-4">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono uppercase text-amber-400">Telnet Frames (App)</span>
+            <span class="text-[11px] font-mono text-slate-400">TCP :2323</span>
+          </div>
+          <div id="stat-telnet-packets" class="text-2xl font-bold font-mono text-amber-300 mt-1">0</div>
+          <div class="text-[11px] text-slate-400 mt-1">IAC (0xFF) Option Negotiation · RFC 854</div>
+        </div>
+      </div>
+
+      <!-- 3 Protocol Status & Quick Control Cards -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <!-- BOOTP Card -->
+        <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="w-3 h-3 rounded-sm bg-blue-500"></span>
+                <h2 class="text-base font-bold text-white">BOOTP Server & Client</h2>
+              </div>
+              <span id="status-badge-bootp"
+                    class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                STOPPED
+              </span>
+            </div>
+            <p class="text-xs text-slate-400 mt-2">
+              Bootstrap Protocol (RFC 951) assigning static & dynamic IPv4 leases from <code class="text-blue-300">192.168.1.100–200</code>.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 mt-4 pt-3 border-t border-slate-800/80">
+            <button data-dash-action="bootp-start"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition">
+              ▶ Start Server
+            </button>
+            <button data-dash-action="bootp-stop"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">
+              ■ Stop
+            </button>
+            <button data-dash-action="bootp-request"
+                    class="ml-auto px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40 transition">
+              Send BOOTREQUEST →
+            </button>
+          </div>
+        </div>
+
+        <!-- DNS Card -->
+        <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="w-3 h-3 rounded-sm bg-emerald-500"></span>
+                <h2 class="text-base font-bold text-white">DNS Authoritative & Resolver</h2>
+              </div>
+              <span id="status-badge-dns"
+                    class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                STOPPED
+              </span>
+            </div>
+            <p class="text-xs text-slate-400 mt-2">
+              Domain Name System (RFC 1035) supporting <code class="text-emerald-300">A, AAAA, MX, CNAME, NS</code> records & label pointer compression.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 mt-4 pt-3 border-t border-slate-800/80">
+            <button data-dash-action="dns-start"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition">
+              ▶ Start Server
+            </button>
+            <button data-dash-action="dns-stop"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">
+              ■ Stop
+            </button>
+            <button data-dash-action="dns-query"
+                    class="ml-auto px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 transition">
+              Query example.local →
+            </button>
+          </div>
+        </div>
+
+        <!-- TELNET Card -->
+        <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="w-3 h-3 rounded-sm bg-amber-500"></span>
+                <h2 class="text-base font-bold text-white">Telnet Server & Web Shell</h2>
+              </div>
+              <span id="status-badge-telnet"
+                    class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                STOPPED
+              </span>
+            </div>
+            <p class="text-xs text-slate-400 mt-2">
+              Telnet Protocol (RFC 854) with live <code class="text-amber-300">IAC WILL/WONT/DO/DONT</code> state machine and sandboxed PTY shell.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 mt-4 pt-3 border-t border-slate-800/80">
+            <button data-dash-action="telnet-start"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white transition">
+              ▶ Start Server
+            </button>
+            <button data-dash-action="telnet-stop"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">
+              ■ Stop
+            </button>
+            <button data-dash-action="telnet-iac"
+                    class="ml-auto px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition">
+              Negotiate IAC →
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Unified Packet Capture Stream Table -->
+      <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h3 class="text-base font-bold text-white">Live Packet Capture Stream (Click any row to decode bits)</h3>
+            <p class="text-xs text-slate-400">Real-time events streamed over <code class="text-sky-300">ws://localhost:8000/ws/packets</code> and persisted to SQLite.</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <select id="dash-log-filter"
+                    class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200">
+              <option value="ALL">All Protocols</option>
+              <option value="BOOTP">BOOTP Only</option>
+              <option value="DNS">DNS Only</option>
+              <option value="TELNET">TELNET Only</option>
+            </select>
+            <input id="dash-log-search" type="text" placeholder="Filter by IP, MAC, domain, xid..."
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-200 w-52" />
+            <button id="export-json-btn"
+                    class="px-3 py-1.5 rounded-lg text-xs font-mono bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+              Export JSON
+            </button>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr class="border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400">
+                <th class="py-2 px-3">Time</th>
+                <th class="py-2 px-3">Protocol</th>
+                <th class="py-2 px-3">Packet Type</th>
+                <th class="py-2 px-3">Source → Destination</th>
+                <th class="py-2 px-3">Key Header Summary</th>
+                <th class="py-2 px-3 text-right">Inspector</th>
+              </tr>
+            </thead>
+            <tbody id="dash-packet-log-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         VIEW 2: PACKET FLOW SEQUENCE VISUALIZER
+         =================================================================== -->
+    <section data-tab-panel="visualizer" class="hidden space-y-4">
+      <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h2 class="text-base font-bold text-white">Real-Time Protocol Sequence Diagram (Client ↔ Server Ladder)</h2>
+            <p class="text-xs text-slate-400">
+              Color-coded by protocol (<span class="text-blue-400 font-semibold">BOOTP=Blue</span>,
+              <span class="text-emerald-400 font-semibold">DNS=Green</span>,
+              <span class="text-amber-400 font-semibold">Telnet=Orange</span>). Click any packet exchange arrow to drill into bit-level header fields.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-3">
+            <span id="seq-packet-count" class="px-2.5 py-1 rounded bg-slate-800 text-xs font-mono text-sky-300">0 packets</span>
+            <select id="seq-protocol-filter"
+                    class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200">
+              <option value="ALL">Show All Protocols</option>
+              <option value="BOOTP">BOOTP (UDP :10067/:10068)</option>
+              <option value="DNS">DNS (UDP :10053)</option>
+              <option value="TELNET">TELNET (TCP :2323)</option>
+            </select>
+            <label class="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
+              <input id="seq-anim-toggle" type="checkbox" checked class="rounded border-slate-700" />
+              Animate Flow
+            </label>
+            <button id="seq-clear-btn"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <div id="seq-selected-summary" class="hidden mb-4"></div>
+
+        <div id="sequence-diagram-canvas"
+             class="bg-slate-950/80 border border-slate-800/90 rounded-xl p-3 overflow-x-auto max-h-[600px] overflow-y-auto">
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         VIEW 3: BIT-LEVEL HEADER DECODER & HEX DUMP
+         =================================================================== -->
+    <section data-tab-panel="decoder" class="hidden space-y-4">
+      <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="text-base font-bold text-white">Bit-Level RFC Packet Header Decoder & Synchronized Hex Dump</h2>
+            <p class="text-xs text-slate-400">
+              Hover over any 32-bit RFC header field or hex byte below to inspect its exact byte offset, binary value, and RFC clause.
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="decoder-load-bootp-sample"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40">
+              Inspect BOOTP (300B)
+            </button>
+            <button id="decoder-load-dns-sample"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40">
+              Inspect DNS Response
+            </button>
+            <button id="decoder-load-telnet-sample"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40">
+              Inspect Telnet IAC
+            </button>
+          </div>
+        </div>
+
+        <!-- Active Packet Metadata Banner -->
+        <div id="decoder-packet-meta"
+             class="flex flex-wrap items-center gap-3 bg-slate-950 border border-slate-800 rounded-lg px-4 py-2.5">
+        </div>
+
+        <!-- Interactive Field Specification Callout -->
+        <div id="decoder-field-inspector"
+             class="bg-slate-950/90 border border-sky-500/40 rounded-xl p-4">
+        </div>
+
+        <!-- Side-by-Side 32-Bit Header Diagram & Wireshark Hex+ASCII Viewer -->
+        <div class="grid grid-cols-1 xl:grid-cols-12 gap-4">
+          <div class="xl:col-span-7 bg-slate-950/75 border border-slate-800 rounded-xl p-4 overflow-x-auto">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-300">
+                32-Bit Word Alignment Header Structure (Bits 0–31)
+              </span>
+              <span class="text-[11px] font-mono text-slate-400">Hover/Click field to highlight bytes</span>
+            </div>
+            <div id="decoder-bit-grid" class="min-w-[540px]"></div>
+          </div>
+
+          <div class="xl:col-span-5 bg-slate-950/75 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-300">
+                Raw Wire Hex + ASCII Dump
+              </span>
+              <span class="text-[11px] font-mono text-sky-400">Offset · 16 Bytes/Row · ASCII</span>
+            </div>
+            <div id="decoder-hex-dump" class="max-h-[440px] overflow-y-auto space-y-0.5"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         VIEW 4: BOOTP SIMULATOR (RFC 951)
+         =================================================================== -->
+    <section data-tab-panel="bootp" class="hidden space-y-5">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        <!-- Server Configuration & Client Request Trigger -->
+        <div class="lg:col-span-5 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-base font-bold text-white">BOOTP Control & Client Simulator</h2>
+              <p class="text-xs text-slate-400 font-mono">RFC 951 · Server UDP :10067 ↔ Client UDP :10068</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button id="bootp-start-btn"
+                      class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white">
+                ▶ Start
+              </button>
+              <button id="bootp-stop-btn"
+                      class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+                ■ Stop
+              </button>
+            </div>
+          </div>
+
+          <!-- Server Pool Config -->
+          <div class="grid grid-cols-2 gap-2.5 pt-2 border-t border-slate-800">
+            <div>
+              <label class="block text-[11px] font-mono text-slate-400">Server IP (siaddr)</label>
+              <input id="bootp-cfg-server-ip" type="text" value="192.168.1.1"
+                     class="w-full mt-1 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white" />
+            </div>
+            <div>
+              <label class="block text-[11px] font-mono text-slate-400">Gateway IP (giaddr)</label>
+              <input id="bootp-cfg-gateway-ip" type="text" value="192.168.1.1"
+                     class="w-full mt-1 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white" />
+            </div>
+            <div>
+              <label class="block text-[11px] font-mono text-slate-400">Pool Start</label>
+              <input id="bootp-cfg-pool-start" type="text" value="192.168.1.100"
+                     class="w-full mt-1 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white" />
+            </div>
+            <div>
+              <label class="block text-[11px] font-mono text-slate-400">Pool End</label>
+              <input id="bootp-cfg-pool-end" type="text" value="192.168.1.200"
+                     class="w-full mt-1 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white" />
+            </div>
+          </div>
+
+          <!-- Client BOOTREQUEST Launcher -->
+          <div class="pt-3 border-t border-slate-800 space-y-2.5">
+            <label class="block text-xs font-semibold text-slate-200">
+              Client Hardware MAC Address (<code class="text-amber-300">chaddr</code>)
+            </label>
+            <div class="flex items-center gap-2">
+              <input id="bootp-mac-input" type="text" value="aa:bb:cc:dd:ee:01"
+                     class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-amber-300" />
+              <button id="bootp-random-mac-btn"
+                      class="px-2.5 py-2 rounded-lg text-xs font-mono bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+                🎲 Random MAC
+              </button>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+              <span class="text-slate-400">Presets:</span>
+              <button data-preset-mac="aa:bb:cc:dd:ee:01" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300">
+                aa:..:01 (Static .10)
+              </button>
+              <button data-preset-mac="aa:bb:cc:dd:ee:02" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300">
+                aa:..:02 (Static .20)
+              </button>
+              <button data-preset-mac="02:42:ac:11:00:99" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-emerald-300">
+                02:42:..:99 (Dynamic)
+              </button>
+            </div>
+            <button id="bootp-send-request-btn"
+                    class="w-full py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider bg-blue-600 hover:bg-blue-500 text-white shadow-lg transition">
+              🚀 Broadcast BOOTREQUEST (300 Bytes)
+            </button>
+          </div>
+        </div>
+
+        <!-- 4-Step Exchange Pipeline + Static Mappings Table -->
+        <div class="lg:col-span-7 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
+          <h3 class="text-sm font-bold uppercase tracking-wider text-blue-400">
+            RFC 951 Bootstrap Exchange Pipeline
+          </h3>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+            <div id="bootp-step-1" class="border border-slate-800 rounded-lg p-2.5 bg-slate-950/60 transition">
+              <div class="text-sky-400 font-bold">1. Socket Bind</div>
+              <div class="text-[11px] text-slate-400 mt-1">Client binds UDP :10068, generates 32-bit xid</div>
+            </div>
+            <div id="bootp-step-2" class="border border-slate-800 rounded-lg p-2.5 bg-slate-950/60 transition">
+              <div class="text-blue-400 font-bold">2. BOOTREQUEST</div>
+              <div class="text-[11px] text-slate-400 mt-1">op=1 broadcast (0x8000) to UDP :10067</div>
+            </div>
+            <div id="bootp-step-3" class="border border-slate-800 rounded-lg p-2.5 bg-slate-950/60 transition">
+              <div class="text-purple-400 font-bold">3. MAC Lookup</div>
+              <div class="text-[11px] text-slate-400 mt-1">Static table check → Dynamic pool fallback</div>
+            </div>
+            <div id="bootp-step-4" class="border border-slate-800 rounded-lg p-2.5 bg-slate-950/60 transition">
+              <div class="text-emerald-400 font-bold">4. BOOTREPLY</div>
+              <div class="text-[11px] text-slate-400 mt-1">op=2 with yiaddr, siaddr, giaddr & cookie</div>
+            </div>
+          </div>
+
+          <div id="bootp-last-reply-card"></div>
+
+          <!-- Static MAC-to-IP Reservation Table -->
+          <div class="pt-3 border-t border-slate-800">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+              <h4 class="text-xs font-bold uppercase tracking-wider text-slate-300">
+                Static MAC → IP Mapping Table (<code class="text-sky-300">data/bootp_pool.json</code>)
+              </h4>
+              <form id="bootp-add-static-form" class="flex items-center gap-1.5">
+                <input id="bootp-new-static-mac" type="text" placeholder="aa:bb:cc:dd:ee:04"
+                       class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white w-36" />
+                <input id="bootp-new-static-ip" type="text" placeholder="192.168.1.40"
+                       class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white w-28" />
+                <button type="submit"
+                        class="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold">
+                  + Add Mapping
+                </button>
+              </form>
+            </div>
+            <div class="overflow-x-auto max-h-44 overflow-y-auto">
+              <table class="w-full text-left border-collapse">
+                <thead>
+                  <tr class="border-b border-slate-800 text-[10px] font-mono uppercase text-slate-400">
+                    <th class="py-1.5 px-3">Hardware MAC (chaddr)</th>
+                    <th class="py-1.5 px-3">Reserved IPv4 (yiaddr)</th>
+                    <th class="py-1.5 px-3">Lease Status</th>
+                    <th class="py-1.5 px-3 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="bootp-static-table-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Visual IP Address Pool Grid -->
+      <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <div>
+            <h3 class="text-base font-bold text-white">Visual IPv4 Address Pool Allocation Map</h3>
+            <p id="bootp-pool-stats" class="text-xs font-mono text-slate-400"></p>
+          </div>
+          <div class="flex items-center gap-3 text-xs font-mono">
+            <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-indigo-500/40 border border-indigo-400"></span> Static Reserved</span>
+            <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-emerald-500/40 border border-emerald-400"></span> Dynamic Leased</span>
+            <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-slate-900 border border-slate-700"></span> Available</span>
+          </div>
+        </div>
+        <div id="bootp-ip-pool-grid" class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-9 gap-2"></div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         VIEW 5: DNS QUERY TOOL & ZONE FILE EDITOR (RFC 1035)
+         =================================================================== -->
+    <section data-tab-panel="dns" class="hidden space-y-5">
+      <div class="theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="text-base font-bold text-white">DNS Resolver & Wire-Format Inspector (RFC 1035)</h2>
+            <p class="text-xs text-slate-400 font-mono">Authoritative Local Zone + Recursive Flag + 0xC00C Label Pointer Compression</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <span id="dns-rtt-badge" class="px-2.5 py-1 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-xs font-mono font-bold">
+              RTT: — ms
+            </span>
+            <button id="dns-start-btn"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">
+              ▶ Start DNS (:10053)
+            </button>
+            <button id="dns-stop-btn"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+              ■ Stop
+            </button>
+          </div>
+        </div>
+
+        <!-- Query Input Bar -->
+        <form id="dns-query-form" class="flex flex-wrap items-center gap-2.5 pt-2 border-t border-slate-800">
+          <input id="dns-domain-input" type="text" value="example.local" placeholder="Enter domain (e.g. example.local)"
+                 class="flex-1 min-w-[220px] bg-slate-950 border border-slate-700 rounded-lg px-3.5 py-2 text-sm font-mono text-white" />
+          <select id="dns-type-select"
+                  class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm font-mono text-emerald-300 font-bold">
+            <option value="A">A (IPv4 Host — 1)</option>
+            <option value="AAAA">AAAA (IPv6 Host — 28)</option>
+            <option value="MX">MX (Mail Exchange — 15)</option>
+            <option value="CNAME">CNAME (Canonical Alias — 5)</option>
+            <option value="NS">NS (Name Server — 2)</option>
+          </select>
+          <label class="flex items-center gap-1.5 text-xs font-mono text-slate-300 px-2">
+            <input id="dns-rd-checkbox" type="checkbox" checked class="rounded border-slate-700" />
+            RD=1 (Recursive Desired)
+          </label>
+          <button type="submit"
+                  class="px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider bg-emerald-600 hover:bg-emerald-500 text-white shadow">
+            🔍 Send DNS Query
+          </button>
+        </form>
+
+        <!-- Preset Quick Queries -->
+        <div class="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+          <span class="text-slate-400">Quick Queries:</span>
+          <button data-dns-preset="example.local:A" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-emerald-300">example.local (A)</button>
+          <button data-dns-preset="www.example.local:CNAME" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300">www.example.local (CNAME)</button>
+          <button data-dns-preset="example.local:MX" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300">example.local (MX)</button>
+          <button data-dns-preset="example.local:NS" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-purple-300">example.local (NS)</button>
+          <button data-dns-preset="ipv6.example.local:AAAA" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-pink-300">ipv6.example.local (AAAA)</button>
+          <button data-dns-preset="unknown.local:A" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-rose-300">unknown.local (NXDOMAIN)</button>
+        </div>
+
+        <!-- Step-by-Step Query Construction -> Wire Format -> Response Parsing -->
+        <div id="dns-pipeline-view" class="pt-2"></div>
+      </div>
+
+      <!-- Authoritative Zone File Table & Raw Editor -->
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        <div class="lg:col-span-7 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+          <h3 class="text-sm font-bold text-white mb-3">Parsed Authoritative Zone Records (<code class="text-emerald-300">data/zone.txt</code>)</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+              <thead>
+                <tr class="border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400">
+                  <th class="py-2 px-3">Domain Name</th>
+                  <th class="py-2 px-3">TTL</th>
+                  <th class="py-2 px-3">Type</th>
+                  <th class="py-2 px-3">RDATA Target</th>
+                  <th class="py-2 px-3 text-right">Test</th>
+                </tr>
+              </thead>
+              <tbody id="dns-zone-records-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="lg:col-span-5 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 flex flex-col">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="text-sm font-bold text-white">Live Zone File Editor</h3>
+            <button id="dns-save-zone-btn"
+                    class="px-3 py-1 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">
+              💾 Save & Reload Zone
+            </button>
+          </div>
+          <textarea id="dns-zone-editor" rows="10"
+                    class="w-full flex-1 bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-emerald-200 focus:outline-none focus:border-emerald-500"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================
+         VIEW 6: TELNET TERMINAL (xterm.js) & IAC NEGOTIATION PANEL
+         =================================================================== -->
+    <section data-tab-panel="telnet" class="hidden space-y-5">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        <!-- Embedded xterm.js Terminal -->
+        <div class="lg:col-span-7 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 class="text-base font-bold text-white">Interactive Telnet Web Terminal (<code class="text-amber-400">xterm.js</code>)</h2>
+              <p class="text-xs text-slate-400 font-mono">RFC 854 NVT · TCP Port 2323 ↔ WebSocket Bridge (<code class="text-sky-300">/ws/telnet</code>)</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <span id="telnet-ws-status" class="px-2.5 py-1 rounded-full text-xs font-mono font-semibold bg-slate-800 text-slate-400 border border-slate-700">
+                Ready
+              </span>
+              <button id="telnet-start-btn"
+                      class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white">
+                ▶ Start (:2323)
+              </button>
+              <button id="telnet-stop-btn"
+                      class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+                ■ Stop
+              </button>
+            </div>
+          </div>
+
+          <!-- Quick Sandboxed Shell Command Buttons -->
+          <div class="flex flex-wrap items-center gap-1.5 text-xs font-mono pt-1">
+            <span class="text-slate-400">Whitelisted Commands:</span>
+            <button data-telnet-cmd="whoami" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300">whoami</button>
+            <button data-telnet-cmd="pwd" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300">pwd</button>
+            <button data-telnet-cmd="ls" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300">ls</button>
+            <button data-telnet-cmd="date" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300">date</button>
+            <button data-telnet-cmd="cat README.txt" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300">cat README.txt</button>
+            <button data-telnet-cmd="echo Hello from Group 3 Telnet!" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-emerald-300">echo ...</button>
+            <button data-telnet-cmd="clear" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400">clear</button>
+          </div>
+
+          <!-- xterm.js Mount Container -->
+          <div id="telnet-xterm-container" class="terminal-viewport-box"></div>
+        </div>
+
+        <!-- Real-Time IAC (0xFF) Option Negotiation Decoder Side Panel -->
+        <div class="lg:col-span-5 theme-surface bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-bold text-white">IAC (<code class="text-amber-400">0xFF</code>) Option Negotiation Decoder</h3>
+              <p class="text-xs text-slate-400">WILL (251) · WONT (252) · DO (253) · DONT (254) · SB/SE (250/240)</p>
+            </div>
+            <button id="telnet-trigger-iac-btn"
+                    class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40">
+              ⚡ Replay IAC Handshake
+            </button>
+          </div>
+
+          <!-- Option State Machine Cards -->
+          <div id="telnet-option-states" class="grid grid-cols-2 gap-2.5"></div>
+
+          <!-- Live IAC Command Sequence Trace -->
+          <div>
+            <div class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">
+              Captured IAC Command Sequences
+            </div>
+            <div id="telnet-iac-log-list" class="space-y-2 max-h-[300px] overflow-y-auto pr-1"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast Notification Stack -->
+  <div id="toast-container" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 max-w-sm"></div>
+
+  <!-- Application Scripts (Roll 27 Modular Architecture) -->
+  <script src="js/packet-visualizer.js"></script>
+  <script src="js/header-decoder.js"></script>
+  <script src="js/bootp-simulator.js"></script>
+  <script src="js/dns-tool.js"></script>
+  <script src="js/terminal.js"></script>
+  <script src="js/app.js"></script>
 </body>
 </html>

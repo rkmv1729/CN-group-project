@@ -1,0 +1,234 @@
+/* ==========================================================================
+   Group 3 — Network, Transport & Application Protocol Visualizer (Roll 27)
+   Custom Stylesheet: Animations, Sequence Diagram, Bit Ruler, Hex Viewer
+   ========================================================================== */
+
+:root {
+  --bg-primary: #0b1120;
+  --bg-secondary: #0f172a;
+  --bg-card: #1e293b;
+  --bg-elevated: #334155;
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --border-color: rgba(148, 163, 184, 0.16);
+  --bootp-color: #3b82f6;
+  --bootp-bg: rgba(59, 130, 246, 0.14);
+  --dns-color: #10b981;
+  --dns-bg: rgba(16, 185, 129, 0.14);
+  --telnet-color: #f59e0b;
+  --telnet-bg: rgba(245, 158, 11, 0.14);
+}
+
+html.light-theme {
+  --bg-primary: #f1f5f9;
+  --bg-secondary: #ffffff;
+  --bg-card: #ffffff;
+  --bg-elevated: #e2e8f0;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --border-color: rgba(15, 23, 42, 0.12);
+}
+
+html.light-theme body {
+  background-color: #f1f5f9 !important;
+  color: #0f172a !important;
+}
+
+html.light-theme .theme-surface {
+  background-color: #ffffff !important;
+  border-color: #cbd5e1 !important;
+  color: #0f172a !important;
+}
+
+html.light-theme .theme-subsurface {
+  background-color: #f8fafc !important;
+  border-color: #e2e8f0 !important;
+  color: #1e293b !important;
+}
+
+html.light-theme .theme-text-muted {
+  color: #475569 !important;
+}
+
+/* Smooth custom scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.45);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.5);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.8);
+}
+
+/* Status indicator pulse */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+.status-dot-live {
+  position: relative;
+}
+
+.status-dot-live::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 9999px;
+  background: inherit;
+  animation: pulse-ring 2s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+}
+
+/* Sequence Diagram SVG animations */
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.seq-arrow-animated {
+  stroke-dasharray: 6 6;
+  animation: dash-flow 0.9s linear infinite;
+}
+
+.seq-packet-row {
+  transition: transform 0.15s ease, filter 0.15s ease;
+  cursor: pointer;
+}
+
+.seq-packet-row:hover {
+  filter: brightness(1.2);
+}
+
+/* RFC Bit-Level Header Grid */
+.bit-grid-header {
+  display: grid;
+  grid-template-columns: repeat(32, minmax(0, 1fr));
+  gap: 1px;
+  background: rgba(51, 65, 85, 0.5);
+  border: 1px solid rgba(100, 116, 139, 0.35);
+  border-radius: 0.5rem 0.5rem 0 0;
+  overflow: hidden;
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+}
+
+.bit-grid-row {
+  display: grid;
+  grid-template-columns: repeat(32, minmax(0, 1fr));
+  gap: 2px;
+  margin-bottom: 2px;
+}
+
+.bit-field-cell {
+  position: relative;
+  padding: 0.55rem 0.45rem;
+  border-radius: 0.35rem;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(30, 41, 59, 0.78);
+  cursor: pointer;
+  transition: all 0.14s ease;
+  overflow: hidden;
+}
+
+.bit-field-cell:hover,
+.bit-field-cell.active-field {
+  border-color: #38bdf8;
+  background: rgba(14, 165, 233, 0.22);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5), 0 6px 16px -4px rgba(14, 165, 233, 0.35);
+  transform: translateY(-1px);
+  z-index: 2;
+}
+
+/* Hex byte cells */
+.hex-byte {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.65rem;
+  height: 1.45rem;
+  border-radius: 0.25rem;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background-color 0.1s ease, color 0.1s ease, transform 0.1s ease;
+  user-select: all;
+}
+
+.hex-byte:hover {
+  background-color: rgba(56, 189, 248, 0.28);
+  color: #f8fafc;
+}
+
+.hex-byte.highlighted {
+  background-color: #0284c7;
+  color: #ffffff;
+  font-weight: 700;
+  transform: scale(1.06);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.65);
+}
+
+.ascii-char {
+  display: inline-block;
+  width: 0.62rem;
+  text-align: center;
+  border-radius: 2px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.75rem;
+}
+
+.ascii-char.highlighted {
+  background-color: #0284c7;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+/* IP Pool Slot Badges */
+.ip-slot {
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.ip-slot:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* Navigation Tabs */
+.nav-tab {
+  position: relative;
+  transition: all 0.15s ease;
+}
+
+.nav-tab.active {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
+/* Terminal wrapper */
+.terminal-viewport-box {
+  background: #090d16;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+  min-height: 360px;
+}

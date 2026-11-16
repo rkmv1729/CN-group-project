@@ -19,7 +19,7 @@ INTERNAL_PORT = 2324
 
 
 def _split_iac(data: bytes) -> tuple[bytes, bytes]:
-    """Separate RFC 854 IAC sequences from plain terminal data."""
+    """Separate RFC 854 IAC sequences from plain NVT terminal data."""
     text_out, iac_out, i = bytearray(), bytearray(), 0
     while i < len(data):
         if data[i] == IAC and i + 1 < len(data):
@@ -50,7 +50,7 @@ class TelnetServerManager:
     _sessions: list[dict[str, Any]] = []
 
     @classmethod
-    def start(cls, port: int = 2323, bind_addr: str = "0.0.0.0") -> tuple[bool, str]:
+    async def start(cls, port: int = 2323, bind_addr: str = "0.0.0.0") -> tuple[bool, str]:
         if cls._proc is not None and cls._proc.poll() is None:
             return False, "Telnet server is already running."
 
@@ -59,26 +59,39 @@ class TelnetServerManager:
             return False, f"Binary not found at {bin_path}. Run 'make' inside telnet/."
 
         cls._proc = subprocess.Popen([bin_path, "-p", str(INTERNAL_PORT), "-b", "127.0.0.1"])
-        loop = asyncio.get_running_loop()
-        loop.create_task(cls._start_proxy(bind_addr, port))
+        try:
+            await cls._start_proxy(bind_addr, port)
+        except OSError as exc:
+            cls._proc.terminate()
+            cls._proc.wait(timeout=3)
+            cls._proc = None
+            return False, f"Failed to bind proxy on {bind_addr}:{port}: {exc}"
+
         return True, f"Telnet proxy listening on {bind_addr}:{port} -> C PTY :{INTERNAL_PORT}."
 
     @classmethod
     async def _start_proxy(cls, bind_addr: str, port: int) -> None:
-        cls._proxy_server = await asyncio.start_server(cls._handle_tcp_client, bind_addr, port)
+        cls._proxy_server = await asyncio.start_server(
+            cls._handle_tcp_client, bind_addr, port, reuse_address=True
+        )
         logger.info("Telnet logging proxy listening on %s:%d", bind_addr, port)
 
     @classmethod
     async def _handle_tcp_client(cls, c_reader: asyncio.StreamReader, c_writer: asyncio.StreamWriter) -> None:
         peer = c_writer.get_extra_info("peername") or ("unknown", 0)
         client_ip, client_port = peer[0], peer[1]
+
         try:
             s_reader, s_writer = await asyncio.open_connection("127.0.0.1", INTERNAL_PORT)
         except Exception:
             c_writer.close()
             return
 
-        session = {"host": client_ip, "port": client_port, "connected_at": datetime.now(timezone.utc).isoformat()}
+        session = {
+            "host": client_ip,
+            "port": client_port,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }
         cls._sessions.append(session)
         pkt_logger = PacketLogger.get_instance()
 
@@ -97,25 +110,33 @@ class TelnetServerManager:
 
                     if iac_bytes:
                         await pkt_logger.log_packet({
-                            "protocol": "TELNET", "type": "IAC_NEGOTIATION",
+                            "protocol": "TELNET",
+                            "type": "IAC_NEGOTIATION",
                             "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "source": src_ep, "destination": dst_ep,
+                            "source": src_ep,
+                            "destination": dst_ep,
                             "packet": {"iac_summary": f"IAC ({len(iac_bytes)}B)", "raw_bytes": list(iac_bytes)},
                             "raw_hex": " ".join(f"{b:02x}" for b in iac_bytes),
                         })
                     if text_bytes:
                         preview = text_bytes.decode("utf-8", errors="replace").strip()[:50]
                         await pkt_logger.log_packet({
-                            "protocol": "TELNET", "type": "TELNET_OUTPUT" if from_server else "TELNET_CMD",
+                            "protocol": "TELNET",
+                            "type": "TELNET_OUTPUT" if from_server else "TELNET_CMD",
                             "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "source": src_ep, "destination": dst_ep,
+                            "source": src_ep,
+                            "destination": dst_ep,
                             "packet": {"iac_summary": preview or "Data", "raw_bytes": list(text_bytes)},
                             "raw_hex": " ".join(f"{b:02x}" for b in text_bytes),
                         })
             except Exception:
                 pass
 
-        await asyncio.gather(pipe(c_reader, s_writer, False), pipe(s_reader, c_writer, True), return_exceptions=True)
+        await asyncio.gather(
+            pipe(c_reader, s_writer, False),
+            pipe(s_reader, c_writer, True),
+            return_exceptions=True,
+        )
         if session in cls._sessions:
             cls._sessions.remove(session)
         c_writer.close()
@@ -152,7 +173,8 @@ async def bridge_ws_to_telnet(websocket: WebSocket, pkt_logger: Any, port: int =
 
     async def log_frame(ptype: str, summary: str, raw: bytes, from_server: bool) -> None:
         await pkt_logger.log_packet({
-            "protocol": "TELNET", "type": ptype,
+            "protocol": "TELNET",
+            "type": ptype,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": {"ip": "127.0.0.1", "port": 2323 if from_server else 51820},
             "destination": {"ip": "127.0.0.1", "port": 51820 if from_server else 2323},
@@ -182,8 +204,11 @@ async def bridge_ws_to_telnet(websocket: WebSocket, pkt_logger: Any, port: int =
                                     writer.write(bytes([IAC, SB, NAWS, 0, 84, 0, 20, IAC, SE]))
                             await writer.drain()
                             await websocket.send_json({
-                                "iac": {"direction": "S → C", "bytes": seq.hex(" ").upper(),
-                                        "desc": f"IAC {CMD_NAMES.get(cmd, cmd)} Opt {opt}"}
+                                "iac": {
+                                    "direction": "S → C",
+                                    "bytes": seq.hex(" ").upper(),
+                                    "desc": f"IAC {CMD_NAMES.get(cmd, cmd)} Opt {opt}",
+                                }
                             })
                             i += 3
                         elif cmd == SB:
