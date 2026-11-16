@@ -1,0 +1,1302 @@
+\chapter{The Core Protocol Engine \& Telnet Server Deep Dive}
+\label{chap:server}
+
+This chapter provides an exhaustive, line-by-line inspection of the Telnet protocol engine and server architecture. Every data structure, circular buffer, parser state machine, pseudoterminal (PTY) allocation, and I/O event loop is broken into small, digestible code passages (5--20 lines each), followed by comprehensive technical explanations covering systems calls, memory layout, concurrency, and failure modes.
+
+% ==============================================================================
+\section{Protocol Constants: \texttt{include/telnet\_proto.h}}
+% ==============================================================================
+
+The header \texttt{include/telnet\_proto.h} establishes the foundational vocabulary of the Telnet protocol suite as standardized across RFC 854, RFC 855, RFC 857, RFC 858, RFC 1073, and RFC 1091.
+
+\subsection{Code Walkthrough: Header Inclusions and Command Verbs}
+
+\begin{lstlisting}[language=C]
+/* Telnet protocol constants (RFC 854, 855, 857, 858, 1073, 1091). */
+#ifndef TELNET_PROTO_H
+#define TELNET_PROTO_H
+
+#include <stdint.h>
+
+#define TN_VERSION "1.0.0"
+#define TN_DEFAULT_PORT 2323
+
+/* Commands */
+enum {
+    TN_SE   = 240, TN_NOP  = 241, TN_DM   = 242, TN_BRK  = 243,
+    TN_IP   = 244, TN_AO   = 245, TN_AYT  = 246, TN_EC   = 247,
+    TN_EL   = 248, TN_GA   = 249, TN_SB   = 250, TN_WILL = 251,
+    TN_WONT = 252, TN_DO   = 253, TN_DONT = 254, TN_IAC  = 255
+};
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 2--3:} Standard preprocessor header guards (\texttt{\#ifndef TELNET\_PROTO\_H}, \texttt{\#define TELNET\_PROTO\_H}) prevent double inclusion errors when multiple source files include this header.
+    \item \textbf{Line 5:} Inclusions of \texttt{<stdint.h>} grants access to fixed-width integer types such as \texttt{uint8\_t} and \texttt{uint16\_t}, ensuring predictable byte sizes across 32-bit and 64-bit architectures.
+    \item \textbf{Lines 7--8:} \texttt{TN\_VERSION} defines the semantic version string. \texttt{TN\_DEFAULT\_PORT} is set to 2323 instead of standard port 23 so that unprivileged non-root users can bind to the socket without requiring \texttt{sudo} permissions.
+    \item \textbf{Lines 11--16:} An anonymous \texttt{enum} establishes the numeric Telnet command codes occupying the byte range 240 through 255. Because these are represented as unsigned 8-bit integers on the wire, values $\ge 240$ cannot collide with standard 7-bit ASCII text ($0$--$127$). Notice that \texttt{TN\_IAC} is assigned decimal 255 (\texttt{0xFF}), the universal escape byte that introduces every protocol command sequence.
+\end{itemize}
+
+\subsection{Code Walkthrough: Option Identifiers and Helper Signatures}
+
+\begin{lstlisting}[language=C]
+/* Options */
+enum {
+    TNO_BINARY = 0,
+    TNO_ECHO   = 1,
+    TNO_SGA    = 3,
+    TNO_TTYPE  = 24,
+    TNO_NAWS   = 31
+};
+
+/* Subnegotiation qualifiers (TERMINAL-TYPE) */
+#define TNSB_IS   0
+#define TNSB_SEND 1
+
+const char *tn_cmd_name(uint8_t cmd);
+const char *tn_opt_name(uint8_t opt);
+
+#endif
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 19--25:} The option enumeration specifies the five Telnet options negotiated by this implementation:
+    \begin{itemize}
+        \item \texttt{TNO\_BINARY} (0): 8-bit binary data transmission (RFC 856).
+        \item \texttt{TNO\_ECHO} (1): Remote character echo (RFC 857).
+        \item \texttt{TNO\_SGA} (3): Suppress Go-Ahead (RFC 858), enabling full-duplex operation.
+        \item \texttt{TNO\_TTYPE} (24): Terminal Type identification (RFC 1091).
+        \item \texttt{TNO\_NAWS} (31): Negotiate About Window Size (RFC 1073).
+    \end{itemize}
+    \item \textbf{Lines 28--29:} RFC 1091 specifies two subnegotiation qualifiers: \texttt{TNSB\_SEND} (1) sent by the server requesting the client's terminal string, and \texttt{TNSB\_IS} (0) sent by the client containing the terminal type payload.
+    \item \textbf{Lines 31--32:} String conversion prototypes (\texttt{tn\_cmd\_name} and \texttt{tn\_opt\_name}) allow debug loggers to format raw bytes as human-readable strings (e.g., converting 251 to \texttt{"WILL"}).
+\end{itemize}
+
+% ==============================================================================
+\section{Memory Management: \texttt{include/buffer.h} \& \texttt{src/common/buffer.c}}
+% ==============================================================================
+
+In high-performance network programming, dynamic memory allocation (\texttt{malloc} and \texttt{free}) inside the hot I/O loop is an anti-pattern: it causes heap fragmentation and introduces unpredictable latency. To buffer data safely between asynchronous network sockets and pseudoterminals, our architecture employs a fixed-capacity circular ring buffer (\texttt{ring\_buf}).
+
+\subsection{Code Walkthrough: Header Interface (\texttt{include/buffer.h})}
+
+\begin{lstlisting}[language=C]
+/* Fixed-capacity byte ring buffer. */
+#ifndef BUFFER_H
+#define BUFFER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    uint8_t *data;
+    size_t   cap, head, len;
+} ring_buf;
+
+int           rb_init(ring_buf *rb, size_t cap);          /* 0 ok, -1 error */
+void          rb_free(ring_buf *rb);
+size_t        rb_len(const ring_buf *rb);
+size_t        rb_space(const ring_buf *rb);
+size_t        rb_write(ring_buf *rb, const uint8_t *src, size_t n); /* returns bytes stored */
+const uint8_t *rb_peek(const ring_buf *rb, size_t *contig);       /* contiguous readable chunk */
+void          rb_consume(ring_buf *rb, size_t n);
+
+#endif
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 8--11:} The \texttt{ring\_buf} struct tracks an underlying dynamically allocated buffer (\texttt{data}) of fixed byte capacity (\texttt{cap}). The \texttt{head} member indicates the index of the oldest unread byte, while \texttt{len} stores the total number of valid bytes currently awaiting consumption.
+    \item \textbf{Lines 13--19:} The interface methods provide $O(1)$ constant-time operations. Notice \texttt{rb\_peek()}: rather than copying bytes out into an intermediate buffer, it returns a direct pointer to the contiguous slice starting at \texttt{head}, allowing zero-copy transmission directly to kernel system calls like \texttt{write()} or \texttt{send()}.
+\end{itemize}
+
+\subsection{Code Walkthrough: Buffer Initialization and Memory Management}
+
+\begin{lstlisting}[language=C]
+#include "buffer.h"
+#include <stdlib.h>
+#include <string.h>
+
+int rb_init(ring_buf *rb, size_t cap)
+{
+    memset(rb, 0, sizeof *rb);
+    if (cap == 0) return -1;
+    rb->data = malloc(cap);
+    if (!rb->data) return -1;
+    rb->cap = cap;
+    return 0;
+}
+
+void rb_free(ring_buf *rb)
+{
+    free(rb->data);
+    memset(rb, 0, sizeof *rb);
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 5--8:} \texttt{rb\_init()} starts by clearing all fields to zero using \texttt{memset()}. It explicitly validates that requested capacity is non-zero; attempting to allocate a zero-byte ring buffer immediately returns an error code of $-1$.
+    \item \textbf{Lines 9--12:} Memory for \texttt{rb->data} is allocated on the heap via \texttt{malloc(cap)}. If the operating system fails to provide memory, the function gracefully handles the failure by returning $-1$ without modifying capacity.
+    \item \textbf{Lines 15--19:} \texttt{rb\_free()} releases the allocated memory and wipes the struct with zeros. This zeroing ensures that any accidental subsequent calls to \texttt{rb\_write()} or \texttt{rb\_peek()} encounter a zero-capacity buffer and fail safely rather than triggering a use-after-free crash.
+\end{itemize}
+
+\subsection{Code Walkthrough: Ring Buffer Write with Circular Wrap-Around}
+
+\begin{lstlisting}[language=C]
+size_t rb_len(const ring_buf *rb)   { return rb->len; }
+size_t rb_space(const ring_buf *rb) { return rb->cap - rb->len; }
+
+size_t rb_write(ring_buf *rb, const uint8_t *src, size_t n)
+{
+    if (n > rb_space(rb)) n = rb_space(rb);
+    if (n == 0) return 0;
+    size_t tail  = (rb->head + rb->len) % rb->cap;
+    size_t first = rb->cap - tail;
+    if (first > n) first = n;
+    memcpy(rb->data + tail, src, first);
+    memcpy(rb->data, src + first, n - first);
+    rb->len += n;
+    return n;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 21--22:} Trivial accessors calculating the current occupancy (\texttt{len}) and remaining available space (\texttt{cap - len}).
+    \item \textbf{Lines 26--27:} Clamp write size: if the caller attempts to write more bytes than remaining capacity, $n$ is truncated to \texttt{rb\_space(rb)}. If the buffer is completely full ($n = 0$), the function immediately returns 0 without touching memory.
+    \item \textbf{Line 28:} The write offset \texttt{tail} is calculated using modulo arithmetic: \texttt{(head + len) \% cap}.
+    \item \textbf{Lines 29--32:} Circular buffer wrapping requires splitting the write into at most two contiguous \texttt{memcpy()} operations:
+    \begin{enumerate}
+        \item \texttt{first = cap - tail}: the number of bytes between \texttt{tail} and the end of the physical array. Up to \texttt{first} bytes are copied into \texttt{data + tail}.
+        \item Any remaining bytes ($n - \text{first}$) wrap around to the physical beginning of the array (\texttt{rb->data}) starting at index 0.
+    \end{enumerate}
+    \item \textbf{Lines 33--34:} Occupancy is incremented by $n$ and the total number of bytes successfully accepted is returned to the caller.
+\end{itemize}
+
+\subsection{Code Walkthrough: Peeking and Consuming Buffer Data}
+
+\begin{lstlisting}[language=C]
+const uint8_t *rb_peek(const ring_buf *rb, size_t *contig)
+{
+    size_t c = rb->cap - rb->head;
+    *contig = rb->len < c ? rb->len : c;
+    return rb->data + rb->head;
+}
+
+void rb_consume(ring_buf *rb, size_t n)
+{
+    if (n > rb->len) n = rb->len;
+    rb->head = (rb->head + n) % rb->cap;
+    rb->len -= n;
+    if (rb->len == 0) rb->head = 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 37--42:} \texttt{rb\_peek()} calculates how many valid bytes can be read contiguously from \texttt{rb->head} before the physical array boundary is reached ($c = \text{cap} - \text{head}$). The smaller of \texttt{len} and $c$ is assigned to \texttt{*contig}, and a direct pointer to \texttt{data + head} is returned.
+    \item \textbf{Lines 44--50:} Once the caller successfully writes or transmits those bytes, \texttt{rb\_consume()} advances \texttt{head} forward by $n$ using modulo arithmetic, and decrements \texttt{len}. Line 49 resets \texttt{head} to 0 whenever the buffer becomes empty, minimizing wrap-around fragmentation.
+\end{itemize}
+
+% ==============================================================================
+\section{Diagnostic Logging: \texttt{include/log.h} \& \texttt{src/common/log.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Logging Header Interface}
+
+\begin{lstlisting}[language=C]
+#ifndef TLOG_H
+#define TLOG_H
+
+typedef enum { LOGLVL_ERROR, LOGLVL_WARN, LOGLVL_INFO, LOGLVL_DEBUG, LOGLVL_TRACE } log_level;
+
+int  log_init(const char *path, log_level lvl);   /* path NULL = stderr */
+void log_close(void);
+int  log_level_from_str(const char *s, log_level *out);
+void log_msg(log_level lvl, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+#define LOGE(...) log_msg(LOGLVL_ERROR, __VA_ARGS__)
+#define LOGW(...) log_msg(LOGLVL_WARN,  __VA_ARGS__)
+#define LOGI(...) log_msg(LOGLVL_INFO,  __VA_ARGS__)
+#define LOGD(...) log_msg(LOGLVL_DEBUG, __VA_ARGS__)
+#define LOGT(...) log_msg(LOGLVL_TRACE, __VA_ARGS__)
+
+#endif
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Line 4:} Enumeration of five logging severity thresholds.
+    \item \textbf{Line 9:} The \texttt{\_\_attribute\_\_((format(printf, 2, 3)))} compiler directive instructs GCC and Clang to perform compile-time type checking on format specifiers against argument types, catching formatting bugs during build.
+    \item \textbf{Lines 11--15:} Ergonomic variadic macros (\texttt{\_\_VA\_ARGS\_\_}) providing shorthand invocations (\texttt{LOGI}, \texttt{LOGE}, etc.).
+\end{itemize}
+
+\subsection{Code Walkthrough: Logging Implementation (\texttt{src/common/log.c})}
+
+\begin{lstlisting}[language=C]
+#include "log.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+
+static FILE     *g_out;
+static int       g_own;
+static log_level g_level = LOGLVL_INFO;
+static const char *names[] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE" };
+
+int log_init(const char *path, log_level lvl)
+{
+    g_level = lvl;
+    if (path) {
+        FILE *f = fopen(path, "ae");
+        if (!f) return -1;
+        g_out = f;
+        g_own = 1;
+    } else {
+        g_out = stderr;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 8--11:} Static file-scope globals maintain logging state: destination stream (\texttt{g\_out}), an ownership flag (\texttt{g\_own}) indicating if the file must be closed on shutdown, current log level filter (\texttt{g\_level}), and string labels.
+    \item \textbf{Lines 13--25:} If a file path is provided, it is opened with mode \texttt{"ae"} (append mode with \texttt{O\_CLOEXEC} set atomically). If \texttt{path} is \texttt{NULL}, logging defaults to standard error (\texttt{stderr}).
+\end{itemize}
+
+\begin{lstlisting}[language=C]
+void log_close(void)
+{
+    if (g_own && g_out) fclose(g_out);
+    g_out = NULL;
+    g_own = 0;
+}
+
+int log_level_from_str(const char *s, log_level *out)
+{
+    for (int i = 0; i < 5; i++)
+        if (strcasecmp(s, names[i]) == 0) { *out = (log_level)i; return 0; }
+    return -1;
+}
+
+void log_msg(log_level lvl, const char *fmt, ...)
+{
+    if (lvl > g_level) return;
+    if (!g_out) g_out = stderr;
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(g_out, "%s [%s] ", ts, names[lvl]);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_out, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_out);
+    fflush(g_out);
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 27--32:} Safely closes the log file if owned, resetting pointers to prevent dangling file operations.
+    \item \textbf{Lines 34--39:} Case-insensitive string matching parses command-line log level flags (e.g., matching \texttt{"DEBUG"} or \texttt{"debug"}).
+    \item \textbf{Lines 41--57:} Formatted message emitter. First checks severity; messages with \texttt{lvl > g\_level} are dropped immediately with zero formatting cost. Uses \texttt{localtime\_r()} for thread-safe timestamp generation, prepends the ISO timestamp and level label, formats the variadic arguments via \texttt{vfprintf()}, appends a newline, and immediately calls \texttt{fflush(g\_out)} to ensure logs are committed to disk even if an imminent crash occurs.
+\end{itemize}
+
+% ==============================================================================
+\section{Network Utilities: \texttt{include/net\_util.h} \& \texttt{src/common/net\_util.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Socket Options and Flags}
+
+\begin{lstlisting}[language=C]
+#include "net_util.h"
+#include "log.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int net_set_nonblock(int fd, bool on)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    fl = on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
+    return fcntl(fd, F_SETFL, fl);
+}
+
+int net_set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
+void net_set_nodelay(int fd)
+{
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 16--22:} Manipulates file status flags using \texttt{fcntl()}. Toggling \texttt{O\_NONBLOCK} ensures that subsequent \texttt{read()}, \texttt{write()}, or \texttt{recv()} calls on this descriptor never block the process; if no data is available, they return immediately with \texttt{EAGAIN} or \texttt{EWOULDBLOCK}.
+    \item \textbf{Lines 24--29:} Sets the \texttt{FD\_CLOEXEC} (Close-on-Exec) flag. This ensures that when the server later forks and executes a shell process via \texttt{execl()}, open sockets are automatically closed in the child and do not leak into the untrusted shell.
+    \item \textbf{Lines 31--35:} Configures \texttt{TCP\_NODELAY} via \texttt{setsockopt()}. This disables the \textit{Nagle algorithm}, which normally buffers small packets to reduce header overhead. In an interactive terminal, buffering keystrokes introduces unbearable visual latency; \texttt{TCP\_NODELAY} forces keystrokes onto the wire immediately.
+\end{itemize}
+
+\subsection{Code Walkthrough: Robust Server Listener Creation (\texttt{net\_listen})}
+
+\begin{lstlisting}[language=C]
+int net_listen(const char *addr, uint16_t port, int backlog)
+{
+    char ps[8];
+    snprintf(ps, sizeof ps, "%u", (unsigned)port);
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    int rc = getaddrinfo(addr, ps, &hints, &res);
+    if (rc) { LOGE("getaddrinfo(%s): %s", addr ? addr : "*", gai_strerror(rc)); return -1; }
+
+    int fd = -1;
+    for (rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, rp->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0 && listen(fd, backlog) == 0) break;
+        LOGE("bind/listen on %s:%s: %s", addr ? addr : "*", ps, strerror(errno));
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 39--47:} Protocol-independent name resolution via \texttt{getaddrinfo()}. Setting \texttt{hints.ai\_family = AF\_UNSPEC} allows the function to seamlessly support either IPv4 or IPv6. \texttt{AI\_PASSIVE} indicates the socket will be used for binding.
+    \item \textbf{Lines 50--52:} Iterates through all returned address candidates. Creates the socket with \texttt{SOCK\_NONBLOCK | SOCK\_CLOEXEC} atomically inside the \texttt{socket()} system call, eliminating race conditions.
+    \item \textbf{Lines 53--55:} Enables \texttt{SO\_REUSEADDR}. When a server is restarted, sockets previously in the \texttt{TIME\_WAIT} state would otherwise cause \texttt{bind()} to fail with \textit{Address already in use}. \texttt{SO\_REUSEADDR} allows instantaneous server restarts.
+    \item \textbf{Lines 55--59:} Binds to the local address and port, and enters the listening state with the requested connection queue depth (\texttt{backlog}). If successful, the loop breaks; otherwise, the descriptor is closed and the next candidate is evaluated.
+    \item \textbf{Lines 60--61:} Frees the linked list allocated by the resolver and returns the listening file descriptor.
+\end{itemize}
+
+\subsection{Code Walkthrough: Client Connect with Timeout (\texttt{net\_connect})}
+
+\begin{lstlisting}[language=C]
+int net_connect(const char *host, const char *port, int family, int timeout_sec)
+{
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = family;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc) { LOGE("%s: %s", host, gai_strerror(rc)); return -1; }
+
+    int fd = -1, last_err = 0;
+    for (rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) { last_err = errno; continue; }
+        net_set_cloexec(fd);
+        net_set_nonblock(fd, true);
+        int r = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (r < 0 && errno == EINPROGRESS) {
+            struct pollfd p = { .fd = fd, .events = POLLOUT };
+            int pr;
+            do { pr = poll(&p, 1, timeout_sec * 1000); } while (pr < 0 && errno == EINTR);
+            if (pr == 0)      { errno = ETIMEDOUT; r = -1; }
+            else if (pr < 0)  { r = -1; }
+            else {
+                int err = 0; socklen_t el = sizeof err;
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                if (err) { errno = err; r = -1; } else r = 0;
+            }
+        }
+        if (r == 0) break;
+        last_err = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) { LOGE("connect to %s port %s: %s", host, port, strerror(last_err)); return -1; }
+    net_set_nonblock(fd, false);
+    net_set_nodelay(fd);
+    return fd;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 78--80:} Initiates non-blocking connection. Setting \texttt{O\_NONBLOCK} prior to calling \texttt{connect()} ensures that a slow or non-responsive remote host does not freeze the calling application for the standard OS TCP timeout (which can be up to 75 seconds).
+    \item \textbf{Lines 80--83:} When \texttt{connect()} returns $-1$ with \texttt{errno == EINPROGRESS}, the three-way handshake has begun in the background. The function waits on the socket using \texttt{poll()} with \texttt{POLLOUT} and an explicit timeout in milliseconds.
+    \item \textbf{Lines 84--90:} If \texttt{poll()} returns 0, the timer expired (\texttt{ETIMEDOUT}). If \texttt{poll()} returns $>0$, the socket is writable, indicating the handshake completed. However, writability can also indicate a failed connection (e.g., received a TCP \texttt{RST}); therefore, line 88 inspects \texttt{SO\_ERROR} using \texttt{getsockopt()} to verify that the handshake truly succeeded with zero error.
+    \item \textbf{Lines 99--101:} Once connected, the socket is returned to blocking mode (or managed by the client loop) and \texttt{TCP\_NODELAY} is enabled.
+\end{itemize}
+
+\subsection{Code Walkthrough: Peer Address Formatting and String Parsing}
+
+\begin{lstlisting}[language=C]
+void net_peer_name(const struct sockaddr *sa, socklen_t len, char *out, size_t cap)
+{
+    char h[NI_MAXHOST], s[NI_MAXSERV];
+    if (getnameinfo(sa, len, h, sizeof h, s, sizeof s, NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        snprintf(out, cap, "unknown");
+        return;
+    }
+    if (sa->sa_family == AF_INET6) snprintf(out, cap, "[%s]:%s", h, s);
+    else                           snprintf(out, cap, "%s:%s", h, s);
+}
+
+int parse_long(const char *s, long min, long max, long *out)
+{
+    if (!s || !*s) return -1;
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || *end != '\0' || v < min || v > max) return -1;
+    *out = v;
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 104--113:} \texttt{net\_peer\_name()} formats any arbitrary \texttt{sockaddr} struct into human-readable notation (e.g., \texttt{192.168.1.50:54321} or \texttt{[::1]:2323}) using \texttt{getnameinfo()} without triggering blocking DNS lookups.
+    \item \textbf{Lines 115--124:} \texttt{parse\_long()} provides strict numerical validation. Unlike standard \texttt{atoi()} which fails silently on invalid input or overflow, this function checks that the entire string was consumed (\texttt{*end == '\textbackslash 0'}), verifies \texttt{errno == 0}, and validates that the parsed value lies strictly within $[min, max]$.
+\end{itemize}
+
+% ==============================================================================
+\section{Option Negotiation Engine: \texttt{telnet\_opts.c} (RFC 1143 Q-Method)}
+% ==============================================================================
+
+\subsection{Code Walkthrough: State Representation and Invalidation}
+
+\begin{lstlisting}[language=C]
+#include "telnet_opts.h"
+#include "telnet_codec.h"
+#include <string.h>
+
+void tn_opts_init(tn_opts *o) { memset(o, 0, sizeof *o); }
+
+void tn_opts_allow(tn_opts *o, uint8_t opt, bool allow_us, bool allow_him)
+{
+    o->allow_us[opt]  = allow_us;
+    o->allow_him[opt] = allow_him;
+}
+
+bool tn_opts_us_on(const tn_opts *o, uint8_t opt)  { return o->us[opt]  == Q_YES; }
+bool tn_opts_him_on(const tn_opts *o, uint8_t opt) { return o->him[opt] == Q_YES; }
+
+static size_t emit(uint8_t cmd, uint8_t opt, uint8_t *out) { return tn_encode_neg(cmd, opt, out); }
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 5--14:} Initializes the options table. \texttt{allow\_us} and \texttt{allow\_him} configure our policy for each of the 256 possible options: whether we agree to enable it locally, and whether we permit the remote peer to enable it.
+    \item \textbf{Line 19:} Helper function encoding a 3-byte negotiation packet (\texttt{IAC <cmd> <opt>}) into the output buffer.
+\end{itemize}
+
+\subsection{Code Walkthrough: Handling Inbound Enable Messages}
+
+\begin{lstlisting}[language=C]
+/* Received WILL (him) or DO (us). */
+static size_t on_enable_msg(uint8_t *q, bool allowed, uint8_t yes, uint8_t no,
+                            uint8_t opt, uint8_t *out)
+{
+    switch (*q) {
+    case Q_NO:
+        if (allowed) { *q = Q_YES; return emit(yes, opt, out); }
+        return emit(no, opt, out);
+    case Q_YES:         return 0;
+    case Q_WANTNO:      *q = Q_NO;  return 0;      /* protocol error by peer */
+    case Q_WANTNO_OPP:  *q = Q_YES; return 0;      /* protocol error by peer */
+    case Q_WANTYES:     *q = Q_YES; return 0;
+    case Q_WANTYES_OPP: *q = Q_WANTNO; return emit(no, opt, out);
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 22--28:} When an inbound enable request is received while in \texttt{Q\_NO} (unsolicited request from peer): if our policy allows it, we transition to \texttt{Q\_YES} and emit an affirming response (\texttt{yes}: \texttt{DO} or \texttt{WILL}). If our policy forbids it, we remain in \texttt{Q\_NO} and emit a refusal (\texttt{no}: \texttt{DONT} or \texttt{WONT}).
+    \item \textbf{Line 29:} If already in \texttt{Q\_YES}, the peer sent a redundant request; we reply with 0 bytes to prevent an echo loop!
+    \item \textbf{Line 32:} If in \texttt{Q\_WANTYES}, the peer is replying to our prior request; we transition to \texttt{Q\_YES} and emit 0 bytes because the transaction is complete.
+\end{itemize}
+
+\subsection{Code Walkthrough: Handling Inbound Disable Messages}
+
+\begin{lstlisting}[language=C]
+/* Received WONT (him) or DONT (us). */
+static size_t on_disable_msg(uint8_t *q, uint8_t yes, uint8_t no, uint8_t opt, uint8_t *out)
+{
+    switch (*q) {
+    case Q_NO:          return 0;
+    case Q_YES:         *q = Q_NO; return emit(no, opt, out);
+    case Q_WANTNO:      *q = Q_NO; return 0;
+    case Q_WANTNO_OPP:  *q = Q_WANTYES; return emit(yes, opt, out);
+    case Q_WANTYES:     *q = Q_NO; return 0;
+    case Q_WANTYES_OPP: *q = Q_NO; return 0;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 41--43:} If in \texttt{Q\_YES} and the peer demands disabling, RFC 854 requires that a demand to disable an option \textbf{must always be honored}. We transition to \texttt{Q\_NO} and emit the required confirmation (\texttt{no}).
+    \item \textbf{Line 44:} If in \texttt{Q\_WANTNO}, this packet confirms our prior disable request; we transition to \texttt{Q\_NO} and emit 0 bytes.
+    \item \textbf{Line 45:} If in \texttt{Q\_WANTNO\_OPP}, the user wanted to disable and immediately re-enable; now that disable is acknowledged, we immediately send the enable request (\texttt{emit(yes)}).
+\end{itemize}
+
+\subsection{Code Walkthrough: Active State Transitions and Main Ingestion}
+
+\begin{lstlisting}[language=C]
+static size_t ask_enable(uint8_t *q, uint8_t yes, uint8_t opt, uint8_t *out)
+{
+    switch (*q) {
+    case Q_NO:          *q = Q_WANTYES; return emit(yes, opt, out);
+    case Q_YES:         return 0;
+    case Q_WANTNO:      *q = Q_WANTNO_OPP; return 0;
+    case Q_WANTNO_OPP:  return 0;
+    case Q_WANTYES:     return 0;
+    case Q_WANTYES_OPP: *q = Q_WANTYES; return 0;
+    }
+    return 0;
+}
+
+static size_t ask_disable(uint8_t *q, uint8_t no, uint8_t opt, uint8_t *out)
+{
+    switch (*q) {
+    case Q_NO:          return 0;
+    case Q_YES:         *q = Q_WANTNO; return emit(no, opt, out);
+    case Q_WANTNO:      return 0;
+    case Q_WANTNO_OPP:  *q = Q_WANTNO; return 0;
+    case Q_WANTYES:     *q = Q_WANTYES_OPP; return 0;
+    case Q_WANTYES_OPP: return 0;
+    }
+    return 0;
+}
+
+int tn_opts_recv(tn_opts *o, uint8_t cmd, uint8_t opt, uint8_t *out, size_t *outlen)
+{
+    uint8_t *q; bool allowed, enable; uint8_t yes, no;
+    switch (cmd) {
+    case TN_WILL: q = &o->him[opt]; allowed = o->allow_him[opt]; yes = TN_DO;   no = TN_DONT; enable = true;  break;
+    case TN_WONT: q = &o->him[opt]; allowed = false;             yes = TN_DO;   no = TN_DONT; enable = false; break;
+    case TN_DO:   q = &o->us[opt];  allowed = o->allow_us[opt];  yes = TN_WILL; no = TN_WONT; enable = true;  break;
+    case TN_DONT: q = &o->us[opt];  allowed = false;             yes = TN_WILL; no = TN_WONT; enable = false; break;
+    default: *outlen = 0; return 0;
+    }
+    bool before = (*q == Q_YES);
+    *outlen = enable ? on_enable_msg(q, allowed, yes, no, opt, out)
+                     : on_disable_msg(q, yes, no, opt, out);
+    return before != (*q == Q_YES);
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 52--76:} Implements local API calls to initiate negotiation changes. If an option is already in the desired state, 0 bytes are emitted.
+    \item \textbf{Lines 78--92:} Ingestion router \texttt{tn\_opts\_recv()}. Selects whether the inbound command targets our state table (\texttt{us}) or peer's state table (\texttt{him}), dispatches to \texttt{on\_enable\_msg} or \texttt{on\_disable\_msg}, and returns $1$ if the effective active state toggled (e.g., $Q\_NO \leftrightarrow Q\_YES$).
+\end{itemize}
+
+% ==============================================================================
+\section{Stream-Safe Codec: \texttt{telnet\_codec.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Parser Data Structures}
+
+\begin{lstlisting}[language=C]
+#include "telnet_codec.h"
+#include <stdlib.h>
+#include <string.h>
+
+enum { ST_DATA, ST_IAC, ST_NEG, ST_SB_OPT, ST_SB, ST_SB_IAC };
+
+struct tn_parser {
+    int      state;
+    bool     collapse_crlf;
+    bool     after_cr;
+    uint8_t  neg_cmd;
+    uint8_t  sb_opt;
+    uint8_t  sb[TN_SB_MAX];
+    size_t   sb_len;
+    bool     sb_overflow;
+    uint8_t  dbuf[1024];
+    size_t   dlen;
+};
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Line 5:} Defines the six internal states of the parser:
+    \begin{itemize}
+        \item \texttt{ST\_DATA}: Normal unescaped character stream.
+        \item \texttt{ST\_IAC}: Saw byte \texttt{0xFF}; awaiting command code.
+        \item \texttt{ST\_NEG}: Saw negotiation verb (\texttt{WILL/WONT/DO/DONT}); awaiting option ID.
+        \item \texttt{ST\_SB\_OPT}: Saw \texttt{SB}; awaiting subnegotiation option ID.
+        \item \texttt{ST\_SB}: Accumulating subnegotiation parameter payload.
+        \item \texttt{ST\_SB\_IAC}: Saw \texttt{IAC} inside subnegotiation; awaiting \texttt{SE} or doubled \texttt{IAC}.
+    \end{itemize}
+    \item \textbf{Lines 7--18:} The parser structure. \texttt{dbuf} accumulates plain text bytes so they can be dispatched to the application in contiguous batches rather than one byte at a time, vastly improving throughput.
+\end{itemize}
+
+\subsection{Code Walkthrough: Feeding the Parser State Machine}
+
+\begin{lstlisting}[language=C]
+int tn_parser_feed(tn_parser *p, const uint8_t *buf, size_t n,
+                   tn_event_cb cb, void *user)
+{
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = buf[i];
+        switch (p->state) {
+        case ST_DATA:
+            if (c == TN_IAC) { p->state = ST_IAC; break; }
+            if (p->after_cr) {
+                p->after_cr = false;
+                if (c == 0 || (p->collapse_crlf && c == '\n')) break;  /* swallow */
+            }
+            if (c == '\r') p->after_cr = true;
+            put_data(p, c, cb, user);
+            break;
+
+        case ST_IAC:
+            switch (c) {
+            case TN_IAC:
+                p->after_cr = false;
+                put_data(p, 0xFF, cb, user);
+                p->state = ST_DATA;
+                break;
+            case TN_WILL: case TN_WONT: case TN_DO: case TN_DONT:
+                p->neg_cmd = c;
+                p->state = ST_NEG;
+                break;
+            case TN_SB:
+                p->state = ST_SB_OPT;
+                break;
+            case TN_SE:                       /* stray SE: ignore */
+                p->state = ST_DATA;
+                break;
+            default: {
+                flush_data(p, cb, user);
+                tn_event ev = { .type = TN_EV_CMD, .cmd = c };
+                cb(&ev, user);
+                p->state = ST_DATA;
+            }
+            }
+            break;
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 74--82:} In \texttt{ST\_DATA}: if \texttt{TN\_IAC} is encountered, the state flips to \texttt{ST\_IAC}. If \texttt{after\_cr} is set and the next byte is \texttt{0} (\texttt{CR NUL}) or \texttt{\textbackslash n} with \texttt{collapse\_crlf} enabled, the character is swallowed, normalizing newlines.
+    \item \textbf{Lines 84--90:} In \texttt{ST\_IAC}: if byte is another \texttt{TN\_IAC}, this is the doubled-IAC escape sequence representing literal byte \texttt{0xFF}; it is emitted as plain data and parser returns to \texttt{ST\_DATA}.
+    \item \textbf{Lines 91--97:} Verbs transition to \texttt{ST\_NEG}; \texttt{TN\_SB} transitions to \texttt{ST\_SB\_OPT}.
+    \item \textbf{Lines 101--106:} Any other single-byte command code (such as \texttt{TN\_IP} or \texttt{TN\_AYT}) flushes pending text and fires a \texttt{TN\_EV\_CMD} event.
+\end{itemize}
+
+\subsection{Code Walkthrough: Subnegotiation Parsing and Output Encoder}
+
+\begin{lstlisting}[language=C]
+        case ST_NEG: {
+            flush_data(p, cb, user);
+            tn_event ev = { .type = TN_EV_NEGOTIATE, .cmd = p->neg_cmd, .opt = c };
+            cb(&ev, user);
+            p->state = ST_DATA;
+            break;
+        }
+
+        case ST_SB_OPT:
+            p->sb_opt = c;
+            p->sb_len = 0;
+            p->sb_overflow = false;
+            p->state = ST_SB;
+            break;
+
+        case ST_SB:
+            if (c == TN_IAC) { p->state = ST_SB_IAC; break; }
+            if (p->sb_len < TN_SB_MAX) p->sb[p->sb_len++] = c;
+            else p->sb_overflow = true;
+            break;
+
+        case ST_SB_IAC:
+            if (c == TN_SE) {
+                flush_data(p, cb, user);
+                if (!p->sb_overflow) {
+                    tn_event ev = { .type = TN_EV_SUBNEG, .opt = p->sb_opt,
+                                    .data = p->sb, .len = p->sb_len };
+                    cb(&ev, user);
+                }
+                p->state = ST_DATA;
+            } else if (c == TN_IAC) {
+                if (p->sb_len < TN_SB_MAX) p->sb[p->sb_len++] = 0xFF;
+                else p->sb_overflow = true;
+                p->state = ST_SB;
+            } else {
+                p->state = ST_DATA;           /* malformed: abandon subnegotiation */
+            }
+            break;
+        }
+    }
+    flush_data(p, cb, user);
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 110--116:} Emits \texttt{TN\_EV\_NEGOTIATE} with the command and option ID.
+    \item \textbf{Lines 125--129:} Inside subnegotiation: bytes are saved into \texttt{sb[]} up to \texttt{TN\_SB\_MAX} (256 bytes). If a malicious client sends megabytes of data without an ending \texttt{SE}, \texttt{sb\_overflow} is flagged to prevent memory exhaustion!
+    \item \textbf{Lines 131--147:} If \texttt{IAC SE} is encountered, pending data is flushed and a \texttt{TN\_EV\_SUBNEG} event is delivered to the application. If any other malformed byte sequence appears, subnegotiation is abandoned safely back to \texttt{ST\_DATA}.
+\end{itemize}
+
+% ==============================================================================
+\section{Server Configuration: \texttt{server\_config.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Argument Parsing and Banner Loader}
+
+\begin{lstlisting}[language=C]
+#include "server_config.h"
+#include "net_util.h"
+#include "telnet_proto.h"
+#include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static char *load_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, f)) > 0) {
+        len += n;
+        if (len == cap) {
+            if (cap >= (1u << 20)) break;          /* cap banner at 1 MiB */
+            cap *= 2;
+            char *nb = realloc(buf, cap + 1);
+            if (!nb) { free(buf); fclose(f); return NULL; }
+            buf = nb;
+        }
+    }
+    buf[len] = '\0';
+    fclose(f);
+    return buf;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 10--30:} \texttt{load\_file()} reads the optional welcome banner from disk. It allocates a dynamic buffer that doubles geometrically on demand via \texttt{realloc()}, but strictly caps file ingestion at 1~MiB (\texttt{cap >= (1u << 20)}) to protect the server from memory denial-of-service attacks.
+\end{itemize}
+
+\subsection{Code Walkthrough: Server Flag Evaluation}
+
+\begin{lstlisting}[language=C]
+int server_parse_args(int argc, char **argv, server_config *cfg)
+{
+    memset(cfg, 0, sizeof *cfg);
+    cfg->bind_addr    = "127.0.0.1";
+    cfg->port         = TN_DEFAULT_PORT;
+    cfg->shell        = "/bin/sh";
+    cfg->max_clients  = 32;
+    cfg->idle_timeout = 0;
+    cfg->log_level    = LOGLVL_INFO;
+
+    static const struct option longopts[] = {
+        {"port", required_argument, 0, 'p'},     {"bind", required_argument, 0, 'b'},
+        {"shell", required_argument, 0, 's'},    {"max-clients", required_argument, 0, 'm'},
+        {"idle-timeout", required_argument, 0, 'w'}, {"banner", required_argument, 0, 'B'},
+        {"log-file", required_argument, 0, 'l'}, {"log-level", required_argument, 0, 'L'},
+        {"allow-root", no_argument, 0, 'R'},     {"version", no_argument, 0, 'v'},
+        {"help", no_argument, 0, 'h'},           {0, 0, 0, 0}
+    };
+
+    long v;
+    int c;
+    while ((c = getopt_long(argc, argv, "p:b:s:m:w:B:l:L:Rvh", longopts, NULL)) != -1) {
+        switch (c) {
+        case 'p':
+            if (parse_long(optarg, 1, 65535, &v)) { fprintf(stderr, "%s: invalid port '%s'\n", argv[0], optarg); return -1; }
+            cfg->port = (uint16_t)v; break;
+        case 'b': cfg->bind_addr = optarg; break;
+        case 's': cfg->shell = optarg; break;
+        case 'm':
+            if (parse_long(optarg, 1, 1024, &v)) { fprintf(stderr, "%s: --max-clients must be 1-1024\n", argv[0]); return -1; }
+            cfg->max_clients = (int)v; break;
+        case 'w':
+            if (parse_long(optarg, 0, 86400, &v)) { fprintf(stderr, "%s: invalid idle timeout '%s'\n", argv[0], optarg); return -1; }
+            cfg->idle_timeout = (int)v; break;
+        case 'B': cfg->banner_file = optarg; break;
+        case 'l': cfg->log_file = optarg; break;
+        case 'L':
+            if (log_level_from_str(optarg, &cfg->log_level)) { fprintf(stderr, "%s: invalid log level '%s'\n", argv[0], optarg); return -1; }
+            break;
+        case 'R': cfg->allow_root = true; break;
+        case 'v': printf("telnet-server %s\n", TN_VERSION); return 1;
+        case 'h': usage(stdout, argv[0]); return 1;
+        default:  usage(stderr, argv[0]); return -1;
+        }
+    }
+    if (optind < argc) { fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0], argv[optind]); usage(stderr, argv[0]); return -1; }
+    if (access(cfg->shell, X_OK) != 0) { fprintf(stderr, "%s: cannot execute shell '%s'\n", argv[0], cfg->shell); return -1; }
+    if (cfg->banner_file) {
+        cfg->banner_text = load_file(cfg->banner_file);
+        if (!cfg->banner_text) { perror(cfg->banner_file); return -1; }
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 56--62:} Defaults are securely assigned: binding only to loopback \texttt{127.0.0.1}, default shell \texttt{/bin/sh}, max 32 concurrent clients.
+    \item \textbf{Lines 64--98:} \texttt{getopt\_long()} evaluates both short and long options with strict numerical bounds checking via \texttt{parse\_long()}.
+    \item \textbf{Line 101:} Uses \texttt{access(cfg->shell, X\_OK)} to verify that the configured shell binary exists and has execute permissions before the server even starts listening.
+\end{itemize}
+
+% ==============================================================================
+\section{Process Lifecycle and Signal Handling: \texttt{src/server/main.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Signal Handlers and Security Gate}
+
+\begin{lstlisting}[language=C]
+#include "log.h"
+#include "server.h"
+#include "server_config.h"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void on_stop(int sig) { (void)sig; server_request_stop(); }
+
+static void on_child(int sig)
+{
+    (void)sig;
+    int saved = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+    errno = saved;
+}
+
+static void install_signals(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_handler = on_stop;                    /* no SA_RESTART: poll() must wake up */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    sa.sa_handler = on_child;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = 0;
+    sigaction(SIGPIPE, &sa, NULL);
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Line 11:} \texttt{on\_stop()} sets a volatile flag requesting graceful shutdown. Notice \texttt{SA\_RESTART} is intentionally omitted for \texttt{SIGINT} and \texttt{SIGTERM} (lines 27--29) so that \texttt{poll()} immediately aborts with \texttt{EINTR}, waking the event loop.
+    \item \textbf{Lines 13--19:} \texttt{on\_child()} is the asynchronous reaper for dead shell processes. When a user exits their shell, the kernel sends \texttt{SIGCHLD}. The loop calls \texttt{waitpid(-1, NULL, WNOHANG)} to reap all terminated child zombies without blocking. Crucially, \texttt{errno} is preserved (\texttt{int saved = errno; ... errno = saved;}) so signal interruption does not corrupt system calls occurring on the main thread.
+    \item \textbf{Lines 35--37:} \texttt{SIGPIPE} is ignored (\texttt{SIG\_IGN}). If a client abruptly severs the connection while the server is writing to the socket, the kernel would otherwise send \texttt{SIGPIPE} which terminates the entire server process! Ignoring \texttt{SIGPIPE} allows \texttt{send()} to fail safely with \texttt{EPIPE}.
+\end{itemize}
+
+\subsection{Code Walkthrough: Server Main Function}
+
+\begin{lstlisting}[language=C]
+static int is_loopback(const char *a)
+{
+    return !strcmp(a, "127.0.0.1") || !strcmp(a, "::1") || !strcmp(a, "localhost");
+}
+
+int main(int argc, char **argv)
+{
+    server_config cfg;
+    int pr = server_parse_args(argc, argv, &cfg);
+    if (pr != 0) return pr > 0 ? 0 : 2;
+
+    if (log_init(cfg.log_file, cfg.log_level) < 0) {
+        perror(cfg.log_file);
+        server_config_free(&cfg);
+        return 1;
+    }
+    if (geteuid() == 0 && !cfg.allow_root) {
+        LOGE("refusing to run as root (a Telnet shell would be a root shell); use -R to override");
+        server_config_free(&cfg);
+        return 1;
+    }
+    if (!is_loopback(cfg.bind_addr))
+        LOGW("binding to %s: traffic, including passwords, is sent in plaintext", cfg.bind_addr);
+
+    install_signals();
+    int rc = server_run(&cfg);
+
+    log_close();
+    server_config_free(&cfg);
+    return rc == 0 ? 0 : 1;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 56--60:} The Root Security Gate. Because Telnet has no built-in authentication, anyone who connects receives an interactive shell with the server's user permissions. The server checks \texttt{geteuid() == 0} and explicitly refuses to execute as root unless the operator supplies the explicit \texttt{-R} flag.
+    \item \textbf{Lines 61--63:} Plaintext warning logged whenever binding to a non-loopback address.
+    \item \textbf{Lines 64--70:} Installs signals, runs the server event loop, and performs clean memory deallocation on exit.
+\end{itemize}
+
+% ==============================================================================
+\section{Session Management \& PTY Allocation: \texttt{src/server/session.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Session Data Structures and Constants}
+
+\begin{lstlisting}[language=C]
+#include "session.h"
+#include "log.h"
+#include "net_util.h"
+#include "telnet_proto.h"
+#include <ctype.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
+#include <pty.h>
+#endif
+
+#define OUT_BUF_SIZE     65536
+#define IN_BUF_SIZE      16384
+#define NEGOTIATION_SECS 2
+#define RECV_CHUNK       1024
+#define SOCK_READ_GATE   2048     /* only read socket if to_pty has this much room */
+#define PTY_READ_GATE    4096     /* only read PTY if to_client has this much room */
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 14--18:} Platform-conditional includes: macOS exposes pseudoterminal functions in \texttt{<util.h>}, whereas Linux provides \texttt{<pty.h>}.
+    \item \textbf{Lines 20--25:} Buffer capacities and backpressure thresholds. \texttt{to\_client} is allocated 64~KiB to absorb large bursts of terminal output (e.g., \texttt{cat large\_file.txt}). \texttt{SOCK\_READ\_GATE} and \texttt{PTY\_READ\_GATE} establish \textbf{backpressure}: if the client cannot read fast enough, the server stops reading from the PTY, preventing unbounded memory growth!
+\end{itemize}
+
+\subsection{Code Walkthrough: Spawning Shell Processes via \texttt{forkpty}}
+
+\begin{lstlisting}[language=C]
+static int spawn_shell(session *s)
+{
+    struct winsize ws = { .ws_row = s->rows, .ws_col = s->cols };
+    int master;
+    pid_t pid = forkpty(&master, NULL, NULL, &ws);
+    if (pid < 0) { LOGE("%s: forkpty: %s", s->peer, strerror(errno)); return -1; }
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);  signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL); signal(SIGCHLD, SIG_DFL);
+        setenv("TERM", s->term[0] ? s->term : "xterm", 1);
+        const char *base = strrchr(s->cfg->shell, '/');
+        base = base ? base + 1 : s->cfg->shell;
+        execl(s->cfg->shell, base, (char *)NULL);
+        _exit(127);
+    }
+    net_set_cloexec(master);
+    net_set_nonblock(master, true);
+    s->pty = master;
+    s->pid = pid;
+    LOGI("%s: shell started (pid %d, TERM=%s, %ux%u)", s->peer, (int)pid,
+         s->term[0] ? s->term : "xterm", s->cols, s->rows);
+    return 0;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 89--92:} \texttt{forkpty()} creates a new pseudoterminal pair (master and slave), sets the window size (\texttt{ws}), forks a child process, attaches the child's standard input, output, and error to the PTY slave, and creates a new login session (\texttt{setsid()}).
+    \item \textbf{Lines 93--101 (Child Process):} Resets all signals to default behaviors (\texttt{SIG\_DFL}), sets the \texttt{TERM} environment variable sanitized from negotiation, determines the executable base name, and replaces the child image with the target shell via \texttt{execl()}. If \texttt{execl()} fails, \texttt{\_exit(127)} terminates the child immediately without flushing parent stdio buffers.
+    \item \textbf{Lines 102--108 (Parent Process):} Sets the PTY master file descriptor to non-blocking and close-on-exec, and stores \texttt{master} and \texttt{pid} in the session object.
+\end{itemize}
+
+\subsection{Code Walkthrough: Deferred Spawning and Negotiation Timeout}
+
+\begin{lstlisting}[language=C]
+static bool resolved(const session *s, uint8_t opt, bool got_data)
+{
+    return got_data || s->opts.him[opt] == Q_NO;      /* answered, or refused */
+}
+
+static void maybe_spawn(session *s, time_t now)
+{
+    if (s->spawned || s->closing || s->dead) return;
+    bool ready = resolved(s, TNO_TTYPE, s->got_ttype) && resolved(s, TNO_NAWS, s->got_naws);
+    if (!ready && now - s->created < NEGOTIATION_SECS) return;
+    s->spawned = true;
+    if (spawn_shell(s) < 0) {
+        queue_text(s, "Failed to start shell.\n");
+        s->closing = true;
+    }
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 111--114:} Determines if an option negotiation has concluded: either the client transmitted the requested data (\texttt{got\_data}), or the client explicitly refused the option (\texttt{Q\_NO}).
+    \item \textbf{Lines 116--126:} \textbf{Deferred Shell Spawning.} If we spawn the shell immediately on connect, the shell reads the default window size (80x24) and default terminal (\texttt{xterm}). Milliseconds later, the client negotiates 120x40 and \texttt{xterm-256color}, causing the shell prompt to misalign. By deferring spawn until NAWS and TTYPE resolve (or until a 2-second timeout expires, allowing plain \texttt{nc} clients to connect), the shell starts with the exact terminal settings from its very first prompt!
+\end{itemize}
+
+\subsection{Code Walkthrough: Socket and PTY I/O Multiplexing Handlers}
+
+\begin{lstlisting}[language=C]
+short session_sock_events(const session *s)
+{
+    short ev = 0;
+    if (!s->closing && rb_space(&s->to_pty) >= SOCK_READ_GATE) ev |= POLLIN;
+    if (rb_len(&s->to_client) > 0) ev |= POLLOUT;
+    return ev;
+}
+
+short session_pty_events(const session *s)
+{
+    if (s->pty < 0) return 0;
+    short ev = 0;
+    if (rb_space(&s->to_client) >= PTY_READ_GATE) ev |= POLLIN;
+    if (rb_len(&s->to_pty) > 0) ev |= POLLOUT;
+    return ev;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 232--247:} Generates dynamic poll event masks. Notice the backpressure gating: the server only listens for incoming socket data (\texttt{POLLIN}) if \texttt{to\_pty} has at least 2048 bytes of free space! It only polls the PTY master for output if \texttt{to\_client} has at least 4096 bytes free. This hardware-like flow control completely prevents memory bloat under asynchronous traffic mismatches.
+\end{itemize}
+
+\begin{lstlisting}[language=C]
+static void sock_readable(session *s)
+{
+    uint8_t buf[RECV_CHUNK];
+    ssize_t n = recv(s->sock, buf, sizeof buf, 0);
+    if (n == 0) { mark_dead(s, "peer closed"); return; }
+    if (n < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) mark_dead(s, strerror(errno));
+        return;
+    }
+    s->last_activity = time(NULL);
+    tn_parser_feed(s->parser, buf, (size_t)n, on_event, s);
+    maybe_spawn(s, s->last_activity);
+}
+
+static void pty_readable(session *s)
+{
+    uint8_t in[1024], out[1024 * 3];
+    ssize_t n = read(s->pty, in, sizeof in);
+    if (n > 0) {
+        size_t m = tn_encode_data(&s->enc, in, (size_t)n, out, sizeof out);
+        queue_out(s, out, m);
+        return;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    /* EOF or EIO: the shell exited */
+    LOGI("%s: shell exited", s->peer);
+    release_pty(s);
+    queue_text(s, "\nConnection closed by server.\n");
+    s->closing = true;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 260--272:} Socket read handler: reads bytes from the network, marks session timestamp for idle timeout tracking, and feeds the byte stream into the Telnet parser state machine.
+    \item \textbf{Lines 284--299:} PTY read handler: reads stdout from the shell, encodes data through \texttt{tn\_encode\_data()} (which escapes literal \texttt{0xFF} bytes as \texttt{IAC IAC} and converts bare CR into \texttt{CR NUL}), and queues the encoded bytes into \texttt{to\_client}. When the user exits the shell (e.g., typing \texttt{exit} or \texttt{Ctrl-D}), \texttt{read()} returns $-1$ with \texttt{EIO} or 0; the server releases the PTY, queues a goodbye message, and enters graceful closing mode.
+\end{itemize}
+
+% ==============================================================================
+\section{The Server Event Reactor: \texttt{src/server/server.c}}
+% ==============================================================================
+
+\subsection{Code Walkthrough: Client Admission Control}
+
+\begin{lstlisting}[language=C]
+#include "server.h"
+#include "log.h"
+#include "net_util.h"
+#include "session.h"
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t g_stop;
+void server_request_stop(void) { g_stop = 1; }
+
+struct ref { session *s; int kind; };    /* kind 0 = socket, 1 = pty */
+
+typedef struct {
+    const server_config *cfg;
+    session *head;
+    int      count;
+} server_ctx;
+
+static void accept_clients(server_ctx *sv, int lfd)
+{
+    for (;;) {
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof ss;
+        int fd = accept4(lfd, (struct sockaddr *)&ss, &sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            LOGW("accept: %s", strerror(errno));
+            return;
+        }
+        char peer[64];
+        net_peer_name((struct sockaddr *)&ss, sl, peer, sizeof peer);
+
+        if (sv->count >= sv->cfg->max_clients) {
+            static const char msg[] = "Server busy, try again later.\r\n";
+            send(fd, msg, sizeof msg - 1, MSG_NOSIGNAL);
+            close(fd);
+            LOGW("%s: rejected (max clients reached)", peer);
+            continue;
+        }
+        net_set_nodelay(fd);
+        session *s = session_new(fd, peer, sv->cfg);
+        if (!s) { close(fd); LOGE("%s: out of memory", peer); continue; }
+        s->next = sv->head;
+        sv->head = s;
+        sv->count++;
+        LOGI("%s: connected (%d active)", peer, sv->count);
+    }
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Line 17:} The \texttt{struct ref} auxiliary mapping table records which session and which file descriptor type (\texttt{0 = socket, 1 = pty}) corresponds to each entry in the flat \texttt{pollfd} array.
+    \item \textbf{Lines 25--36:} \texttt{accept\_clients()} runs in an infinite loop using \texttt{accept4()} with \texttt{SOCK\_NONBLOCK | SOCK\_CLOEXEC} until the kernel backlog is drained (\texttt{EAGAIN}).
+    \item \textbf{Lines 40--46:} Connection Admission Gate: if active client count reaches \texttt{max\_clients}, the server transmits a rejection message (\texttt{"Server busy"}) with \texttt{MSG\_NOSIGNAL} and closes the socket immediately, defending against connection flooding.
+    \item \textbf{Lines 47--54:} Sets \texttt{TCP\_NODELAY}, allocates a new session object, prepends it to the active singly-linked list (\texttt{sv->head}), and increments the client counter.
+\end{itemize}
+
+\subsection{Code Walkthrough: The Central Multiplexing Event Loop}
+
+\begin{lstlisting}[language=C]
+int server_run(const server_config *cfg)
+{
+    int lfd = net_listen(cfg->bind_addr, cfg->port, 64);
+    if (lfd < 0) return -1;
+
+    size_t maxp = 1 + 2 * (size_t)cfg->max_clients;
+    struct pollfd *pfds = calloc(maxp, sizeof *pfds);
+    struct ref    *refs = calloc(maxp, sizeof *refs);
+    if (!pfds || !refs) { close(lfd); free(pfds); free(refs); return -1; }
+
+    server_ctx sv = { .cfg = cfg };
+    LOGI("listening on %s port %u (max %d clients, shell %s)",
+         cfg->bind_addr, (unsigned)cfg->port, cfg->max_clients, cfg->shell);
+
+    int rc = 0;
+    while (!g_stop) {
+        size_t np = 0;
+        pfds[np] = (struct pollfd){ .fd = lfd, .events = POLLIN };
+        refs[np] = (struct ref){ NULL, 0 };
+        np++;
+        for (session *s = sv.head; s; s = s->next) {
+            pfds[np] = (struct pollfd){ .fd = s->sock, .events = session_sock_events(s) };
+            refs[np] = (struct ref){ s, 0 };
+            np++;
+            short pe = session_pty_events(s);
+            if (pe) {
+                pfds[np] = (struct pollfd){ .fd = s->pty, .events = pe };
+                refs[np] = (struct ref){ s, 1 };
+                np++;
+            }
+        }
+
+        int r = poll(pfds, (nfds_t)np, 250);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            LOGE("poll: %s", strerror(errno));
+            rc = -1;
+            break;
+        }
+        if (r > 0) {
+            if (pfds[0].revents & POLLIN) accept_clients(&sv, lfd);
+            for (size_t i = 1; i < np; i++) {
+                if (!pfds[i].revents) continue;
+                if (refs[i].kind == 0) session_handle_sock(refs[i].s, pfds[i].revents);
+                else                   session_handle_pty(refs[i].s, pfds[i].revents);
+            }
+        }
+        reap_sessions(&sv, time(NULL));
+    }
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 78--82:} Preallocates flat arrays for \texttt{pfds} and \texttt{refs}. The maximum possible descriptor count is $1 + 2 \times \text{max\_clients}$ (1 listening socket + 1 socket and 1 PTY master descriptor per active client).
+    \item \textbf{Lines 88--103:} Loop construction: index 0 is always assigned to the listening socket (\texttt{lfd}). The session list is walked, populating \texttt{pfds} with active socket and PTY master descriptors according to their current backpressure masks.
+    \item \textbf{Line 105:} \texttt{poll(pfds, np, 250)} blocks the thread until an I/O event occurs or a 250~ms timeout elapses. The timeout ensures periodic execution of session timers and reaper logic even during periods of network silence.
+    \item \textbf{Lines 112--119:} Dispatches events: if \texttt{pfds[0]} is readable, \texttt{accept\_clients()} is called. For all other descriptors, events are routed to either \texttt{session\_handle\_sock} or \texttt{session\_handle\_pty} based on \texttt{refs[i].kind}.
+    \item \textbf{Line 120:} \texttt{reap\_sessions()} checks idle timeouts, reaps dead sessions, and frees linked list nodes.
+\end{itemize}
+
+\subsection{Code Walkthrough: Graceful Shutdown Teardown}
+
+\begin{lstlisting}[language=C]
+    LOGI("shutting down (%d session(s))", sv.count);
+    while (sv.head) {
+        session *s = sv.head;
+        sv.head = s->next;
+        session_free(s);
+    }
+    close(lfd);
+    free(pfds);
+    free(refs);
+    return rc;
+}
+\end{lstlisting}
+
+\paragraph{Line-by-Line Analysis:}
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Lines 123--132:} When \texttt{g\_stop} is raised by \texttt{SIGINT} or \texttt{SIGTERM}, the loop exits cleanly. The server iterates through all active sessions, terminates their shell processes with \texttt{SIGHUP}, closes their sockets, frees their ring buffers, closes the listener socket, releases allocated array memory, and returns exit code 0.
+\end{itemize}

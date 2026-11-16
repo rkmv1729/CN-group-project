@@ -1,0 +1,499 @@
+\chapter{Networking \& Telnet from First Principles}
+\label{chap:fundamentals}
+
+\section{Introduction to Computer Networking}
+
+Modern distributed systems rest entirely upon the abstraction of computer networking: the ability of two or more independent computing devices to exchange discrete packets of electronic or optical information across physical transmission media. However, to a programmer writing applications in user space, this vast physical infrastructure consisting of copper twisted-pair cables, fiber-optic backbones, routers, switches, and radio transceivers is completely abstracted away by the host operating system kernel.
+
+To understand how a remote terminal protocol like Telnet operates, one must first demystify the conceptual layers that connect a physical keystroke on one machine to an interactive shell process executing on a machine located across the room or across the globe.
+
+\subsection{The Network Hierarchy: Packets, Routers, and Links}
+
+When software transmits data over a network, the operating system does not maintain a direct physical wire between the two programs. Instead, modern networking is based on \textbf{packet switching}. Information is segmented into small, manageable chunks called \textit{packets} (or datagrams). Each packet is stamped with metadata indicating where it originated, where it is addressed, its sequence within the larger stream, and error-checking checksums.
+
+\begin{beginnerconcept}[What is a Packet?]
+Think of a physical book. If you wanted to mail a 500-page manuscript to a friend, but the postal carrier only accepted single-page envelopes, you would have to tear the book into individual pages. On each page, you would write:
+\begin{itemize}[leftmargin=1.5em]
+    \item Sender address (Source IP and port).
+    \item Recipient address (Destination IP and port).
+    \item Page number and total page count (Sequence and Acknowledgment numbers).
+\end{itemize}
+The post office routes these individual envelopes through various trucks, sorting facilities, and airplanes. Some envelopes might arrive out of order, and some might even get lost in transit. The recipient must collect the envelopes, request replacements for missing pages, sort them into page order, and reassemble the manuscript before reading it. This is exactly what the networking stack does automatically.
+\end{beginnerconcept}
+
+Intermediate specialized devices called \textbf{routers} inspect the destination address on each packet header and determine the optimal next physical link (next hop) to forward it toward its final destination. Because routing decisions are made independently for each packet, packets can theoretically traverse different physical paths through the global internetwork and arrive at the destination out of order, duplicated, or corrupted.
+
+\subsection{Addressing Entities: IP Addresses and Ports}
+
+For two nodes to communicate, there must exist a globally unambiguous addressing scheme. This is provided by the \textbf{Internet Protocol (IP)}.
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{IPv4 (Internet Protocol version 4):} An IPv4 address is a 32-bit integer, traditionally represented in human-readable ``dotted-quad'' notation (four decimal numbers between 0 and 255 separated by periods, e.g., \texttt{192.168.1.1} or \texttt{127.0.0.1}). A 32-bit address space yields at most $2^{32} \approx 4.29 \times 10^9$ unique addresses.
+    \item \textbf{IPv6 (Internet Protocol version 6):} Developed to replace IPv4 due to global address exhaustion, IPv6 uses 128-bit addresses, written as eight groups of four hexadecimal digits separated by colons (e.g., \texttt{2001:0db8:85a3:0000:0000:8a2e:0370:7334}, which can be compressed by replacing consecutive zeros with \texttt{::1}).
+    \item \textbf{The Loopback Interface:} Every operating system reserves a virtual, software-only network interface called \textit{loopback}. In IPv4, this is the \texttt{127.0.0.0/8} block (commonly \texttt{127.0.0.1}, named \texttt{localhost}); in IPv6, it is \texttt{::1}. Packets sent to loopback never touch physical hardware; the kernel immediately routes outgoing packets directly into its own incoming network queues.
+\end{enumerate}
+
+However, an IP address identifies only a physical or virtual \textit{host machine}. A single computer may simultaneously run dozens of networked programs: a web browser, a database, a music streamer, and a Telnet server. How does the kernel know which process should receive a given packet?
+
+This multiplexing is achieved through \textbf{ports}. A port is an unsigned 16-bit integer ranging from $1$ to $65,535$:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Well-Known Ports (0--1023):} Reserved by convention for standard system services. For example, HTTP is port 80, HTTPS is port 443, SSH is port 22, and standard Telnet is port 23. Binding to ports below 1024 on UNIX systems historically requires administrative (\texttt{root}) privileges.
+    \item \textbf{Registered Ports (1024--49151):} Assigned by IANA for specific vendor applications. Our custom Telnet project defaults to port \texttt{2323} to allow unprivileged execution.
+    \item \textbf{Dynamic / Ephemeral Ports (49152--65535):} Automatically assigned by the client OS kernel when an application initiates an outbound connection.
+\end{itemize}
+
+A unique end-to-end network conversation is therefore globally identified by a \textbf{5-tuple}:
+\begin{equation}
+\label{eq:5tuple}
+\text{Conversation} = \Big(\text{Protocol},~\text{Source IP},~\text{Source Port},~\text{Dest IP},~\text{Dest Port}\Big)
+\end{equation}
+
+\subsection{Transport Protocols: TCP vs. UDP}
+
+Operating immediately above the IP layer is the Transport Layer, dominated by two fundamentally distinct protocols:
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Property} & \textbf{TCP (Transmission Control Protocol)} & \textbf{UDP (User Datagram Protocol)} \\
+\midrule
+\textbf{Connection State} & Connection-oriented (requires 3-way handshake) & Connectionless (fire and forget) \\
+\textbf{Reliability} & Guaranteed delivery (lost packets retransmitted) & Unreliable (dropped packets remain lost) \\
+\textbf{Ordering} & Strictly in-order byte stream & Out-of-order delivery possible \\
+\textbf{Data Model} & Unstructured stream of bytes & Discrete datagram messages with boundaries \\
+\textbf{Flow/Congestion Control} & Dynamic windowing, backpressure, slow start & None (application must pace itself) \\
+\textbf{Header Overhead} & Minimum 20 bytes (up to 60 bytes with options) & Fixed 8 bytes \\
+\textbf{Ideal Use Case} & Interactive shells, file transfer, web pages & Real-time audio/video, gaming, DNS queries \\
+\bottomrule
+\end{tabular}
+\caption{Architectural comparison between TCP and UDP.}
+\label{tab:tcp_vs_udp}
+\end{table}
+
+Telnet requires an absolute guarantee that every single keystroke, control sequence, and terminal response arrives intact, uncorrupted, and in the exact chronological sequence it was typed. If a keystroke like \texttt{rm -rf /tmp/test} were dropped or reordered by the network into \texttt{rm -rf /}, the result would be catastrophic. Hence, Telnet is built exclusively on top of \textbf{TCP}.
+
+\subsection{Client-Server Architecture}
+
+In network computing, the client-server pattern defines the relationship between two communicating processes:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{The Server (Passive Role):} Starts up, binds to a well-known local address and port, enters a passive ``listening'' state, and waits indefinitely for incoming connections. A single server typically multiplexes many concurrent clients.
+    \item \textbf{The Client (Active Role):} Initiates contact by issuing a connection request to the server's known IP and port. Once connected, client and server exchange messages symmetrically until either side closes the connection.
+\end{itemize}
+
+% ==============================================================================
+\section{Sockets and Operating System Primitives}
+% ==============================================================================
+
+In UNIX-like operating systems (such as Linux and macOS), the operating system architecture is guided by the philosophy that \textit{``Everything is a file.''} 
+
+When a process reads from a file on disk, reads keystrokes from the keyboard, writes text to a terminal screen, or transmits bytes over a gigabit Ethernet card, it interacts with the resource through an integer known as a \textbf{File Descriptor (FD)}.
+
+\subsection{What is a Socket?}
+
+A \textbf{socket} is a kernel abstraction that presents a network communication endpoint as a file descriptor. When an application creates a socket via the \texttt{socket()} system call, the kernel allocates an internal data structure containing transmit buffers, receive buffers, protocol state machines, IP addresses, and routing tables, and returns a small non-negative integer (e.g., \texttt{3}, \texttt{4}, \texttt{5}) representing that socket table entry.
+
+\begin{underthehood}[The Kernel Socket Buffers]
+When you call \texttt{write(fd, data, len)} on a TCP socket, your data is \textit{not} immediately launched onto the physical wire. Instead, the kernel copies your bytes from user-space memory into the socket's internal \textbf{kernel send buffer} (\texttt{SO\_SNDBUF}). The TCP engine divides those bytes into Maximum Segment Size (MSS) packets, adds headers, and hands them to the network card driver.
+
+Similarly, when incoming packets arrive from the network card, the kernel verifies their checksums, reorders them, strips the IP and TCP headers, and deposits the raw payload into the socket's \textbf{kernel receive buffer} (\texttt{SO\_RCVBUF}). When your program calls \texttt{read(fd, buffer, sizeof(buffer))}, the kernel copies bytes from this receive buffer into your user-space array.
+\end{underthehood}
+
+\subsection{The Berkeley Sockets API Lifecycle}
+
+Figure~\ref{fig:socket_lifecycle} illustrates the complete lifecycle of a TCP connection, showing the exact system calls invoked on both the server and client sides, the underlying three-way handshake, the bidirectional data exchange phase, and the four-way graceful teardown.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    scale=0.9, every node/.style={transform shape},
+    box/.style={rectangle, draw=black!70, fill=blue!10, rounded corners=3pt, text width=4.2cm, minimum height=0.75cm, align=center, font=\small\sffamily},
+    cbox/.style={rectangle, draw=black!70, fill=green!10, rounded corners=3pt, text width=4.2cm, minimum height=0.75cm, align=center, font=\small\sffamily},
+    kbox/.style={rectangle, draw=black!50, fill=gray!15, dashed, rounded corners=2pt, text width=3.8cm, minimum height=0.6cm, align=center, font=\scriptsize\ttfamily},
+    arrow/.style={-{Stealth[length=2.5mm]}, thick},
+    netarrow/.style={-{Stealth[length=2.5mm]}, thick, color=red!70!black}
+]
+
+% Server Column
+\node[font=\bfseries\large\sffamily] (server_title) at (0, 0) {Telnet Server};
+\node[box, below=0.4cm of server_title] (s_sock) {\texttt{socket(AF\_INET, ...)}\\\footnotesize Allocate listener socket FD};
+\node[box, below=0.4cm of s_sock] (s_bind) {\texttt{bind(fd, "0.0.0.0", 2323)}\\\footnotesize Bind to IP address and port};
+\node[box, below=0.4cm of s_bind] (s_listen) {\texttt{listen(fd, backlog=64)}\\\footnotesize Mark FD as passive listener};
+\node[box, below=0.4cm of s_listen] (s_poll) {\texttt{poll([lfd], timeout)}\\\footnotesize Block waiting for incoming SYN};
+\node[box, below=1.4cm of s_poll] (s_accept) {\texttt{accept4(lfd, ...)}\\\footnotesize Returns new client socket FD};
+
+% Client Column
+\node[font=\bfseries\large\sffamily] (client_title) at (8.5, 0) {Telnet Client};
+\node[cbox, below=0.4cm of client_title] (c_sock) {\texttt{socket(AF\_INET, ...)}\\\footnotesize Allocate client socket FD};
+\node[cbox, below=1.6cm of c_sock] (c_conn) {\texttt{connect(fd, "127.0.0.1", 2323)}\\\footnotesize Initiate TCP 3-Way Handshake};
+
+% Handshake Annotations
+\draw[netarrow] ($(c_conn.west)+(0,0.1)$) -- node[above, font=\scriptsize\sffamily, sloped] {\textbf{1. SYN}} ($(s_poll.east)+(0,-0.6)$);
+\draw[netarrow] ($(s_poll.east)+(0,-0.9)$) -- node[below, font=\scriptsize\sffamily, sloped] {\textbf{2. SYN + ACK}} ($(c_conn.west)+(0,-0.2)$);
+\draw[netarrow] ($(c_conn.west)+(0,-0.5)$) -- node[above, font=\scriptsize\sffamily, sloped] {\textbf{3. ACK}} ($(s_accept.east)+(0,0.2)$);
+
+% Data Transfer Phase
+\node[box, fill=purple!10, below=1.2cm of s_accept] (s_data) {\texttt{recv()} / \texttt{send()} Loop\\\footnotesize Multiplexed with PTY Shell via \texttt{poll()}};
+\node[cbox, fill=purple!10, below=2.6cm of c_conn] (c_data) {\texttt{poll()} Loop\\\footnotesize Multiplexes Stdin with Socket};
+
+\draw[netarrow, {Stealth[length=2.5mm]}-{Stealth[length=2.5mm]}, double] (s_data) -- node[above, font=\scriptsize\sffamily] {Bidirectional TCP Stream} node[below, font=\scriptsize\sffamily] {ASCII Data + IAC Protocol Bytes} (c_data);
+
+% Connection Teardown
+\node[cbox, below=1.2cm of c_data] (c_close) {\texttt{close(fd)}\\\footnotesize Initiates active close};
+\node[box, below=1.2cm of s_data] (s_close) {\texttt{close(fd)}\\\footnotesize Closes peer socket and frees session};
+
+\draw[netarrow] (c_close.west) -- node[above, font=\scriptsize\sffamily, sloped] {\textbf{FIN}} ($(s_close.east)+(0,0.3)$);
+\draw[netarrow] ($(s_close.east)+(0,0.1)$) -- node[below, font=\scriptsize\sffamily, sloped] {\textbf{ACK}} ($(c_close.west)+(0,-0.2)$);
+\draw[netarrow] ($(s_close.east)+(0,-0.2)$) -- node[above, font=\scriptsize\sffamily, sloped] {\textbf{FIN}} ($(c_close.west)+(0,-0.5)$);
+\draw[netarrow] ($(c_close.west)+(0,-0.7)$) -- node[below, font=\scriptsize\sffamily, sloped] {\textbf{ACK}} ($(s_close.east)+(0,-0.4)$);
+
+% Internal arrows
+\draw[arrow] (s_sock) -- (s_bind);
+\draw[arrow] (s_bind) -- (s_listen);
+\draw[arrow] (s_listen) -- (s_poll);
+\draw[arrow] (s_poll) -- (s_accept);
+\draw[arrow] (s_accept) -- (s_data);
+\draw[arrow] (s_data) -- (s_close);
+
+\draw[arrow] (c_sock) -- (c_conn);
+\draw[arrow] (c_conn) -- (c_data);
+\draw[arrow] (c_data) -- (c_close);
+
+\end{tikzpicture}
+\caption{The TCP socket lifecycle: Server and Client interaction sequence.}
+\label{fig:socket_lifecycle}
+\end{figure}
+
+\subsection{The Fallacy of Message Boundaries: Byte Streams vs. Messages}
+
+One of the most frequent misconceptions encountered by novice network engineers is the assumption that calling \texttt{send(fd, "HELLO", 5, 0)} on one side will cause the remote peer's \texttt{recv(fd, buf, sizeof(buf), 0)} to return exactly 5 bytes with \texttt{"HELLO"}.
+
+\textbf{TCP does not preserve application message boundaries.} TCP is an unformatted, continuous stream of bytes. When an application calls \texttt{send()}, the operating system can segment that data in any manner it sees fit:
+\begin{itemize}[leftmargin=1.5em]
+    \item A single \texttt{send()} of 1000 bytes might be broken by the sender's network stack into three separate packets of 300, 400, and 300 bytes.
+    \item Ten separate \texttt{send()} calls of 10 bytes each might be aggregated by the kernel's \textit{Nagle algorithm} into a single 100-byte packet.
+    \item A single call to \texttt{recv()} may return 1 byte, 14 bytes, 500 bytes, or all 1000 bytes.
+\end{itemize}
+
+\begin{commonpitfall}[Assuming Atomic Reads]
+Never write code that assumes an entire protocol command arrives in a single \texttt{recv()} or \texttt{read()} invocation! If you send a 3-byte Telnet command \texttt{[IAC, WILL, ECHO]}, the peer might receive the first two bytes \texttt{[IAC, WILL]} in one packet, and the final byte \texttt{[ECHO]} in a subsequent packet milliseconds later. 
+
+Any robust protocol decoder \textbf{must} be implemented as a state machine that processes data one byte at a time and maintains state across arbitrarily fragmented \texttt{recv()} buffers.
+\end{commonpitfall}
+
+\subsection{I/O Multiplexing: The Power of \texttt{poll()}}
+
+If a program has two file descriptors (for example, standard input \texttt{STDIN\_FILENO} and a network socket \texttt{sock}), a naive implementation might attempt:
+\begin{lstlisting}[language=C]
+char buf[128];
+while (1) {
+    read(STDIN_FILENO, buf, sizeof(buf)); // BLOCKS HERE!
+    send(sock, buf, ...);
+    recv(sock, buf, sizeof(buf), 0);      // CANNOT GET HERE!
+}
+\end{lstlisting}
+If the user does not type anything, the program is indefinitely suspended on \texttt{read(STDIN\_FILENO)}. Even if the remote server sends hundreds of bytes of terminal output over the socket, the client cannot display them because it is frozen waiting for keyboard input.
+
+To solve this concurrency dilemma without resorting to heavy multi-threading or complex shared-memory locking, UNIX systems provide \textbf{I/O Multiplexing} system calls: \texttt{select()}, \texttt{poll()}, and \texttt{epoll()}. Our implementation uses \texttt{poll()} (\texttt{poll.h}):
+
+\begin{lstlisting}[language=C]
+struct pollfd pfds[2];
+pfds[0].fd = STDIN_FILENO; pfds[0].events = POLLIN;
+pfds[1].fd = sock;         pfds[1].events = POLLIN;
+
+int ready = poll(pfds, 2, timeout_ms);
+\end{lstlisting}
+The kernel puts the process to sleep and wakes it up immediately when \textit{either} descriptor has bytes ready to be read. This allows a single-threaded process to react instantaneously to keyboard events, network arrivals, and timer expirations with zero CPU-spinning overhead.
+
+\subsection{Character Encodings: ASCII, UTF-8, and Control Codes}
+
+Computers store only binary bits ($0$ and $1$). To represent human language, numbers must be mapped to printable glyphs via a \textbf{character encoding}:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{ASCII (American Standard Code for Information Interchange):} A 7-bit standard defining values from $0$ to $127$ ($0\text{x}00$ to $0\text{x}7\text{F}$). Values $32$--$126$ are printable characters (\texttt{'A'}, \texttt{'b'}, \texttt{'1'}, \texttt{'!'}). Values $0$--$31$ and $127$ are non-printable \textit{control codes}:
+    \begin{itemize}
+        \item \texttt{0x00} (\texttt{NUL}): Null byte.
+        \item \texttt{0x03} (\texttt{ETX}): End of Text (mapped on UNIX to \texttt{Ctrl-C} / \texttt{SIGINT}).
+        \item \texttt{0x04} (\texttt{EOT}): End of Transmission (mapped to \texttt{Ctrl-D} / EOF).
+        \item \texttt{0x0A} (\texttt{LF} / \texttt{\textbackslash n}): Line Feed (moves cursor down).
+        \item \texttt{0x0D} (\texttt{CR} / \texttt{\textbackslash r}): Carriage Return (moves cursor to leftmost column).
+        \item \texttt{0x1B} (\texttt{ESC}): Escape (starts ANSI terminal escape sequences).
+    \end{itemize}
+    \item \textbf{UTF-8:} A backward-compatible, variable-length Unicode encoding. Any ASCII byte ($0$--$127$) is encoded identically as a single byte. Non-ASCII characters (such as accented characters, emoji, or non-Latin alphabets) are encoded using 2 to 4 consecutive bytes whose high bits are set ($\ge 128$ / $0\text{x}80$).
+\end{itemize}
+
+% ==============================================================================
+\section{The Telnet Protocol Specification}
+% ==============================================================================
+
+Telnet, codified in \textbf{RFC 854} and \textbf{RFC 855} in May 1983, is one of the oldest application-layer protocols on the Internet. Its objective is to provide a fairly general, bi-directional, eight-bit oriented communications facility, primarily serving to connect a terminal to a remote host.
+
+\subsection{The Network Virtual Terminal (NVT)}
+
+In the early 1970s and 1980s, computer hardware was extraordinarily heterogeneous. One manufacturer's terminal used non-standard cursor control keys, another required specific carriage return delays, and another used EBCDIC rather than ASCII.
+
+To eliminate the need for clients and servers to maintain custom code for every hardware terminal in existence, Telnet introduced the concept of the \textbf{Network Virtual Terminal (NVT)}. The NVT is an imaginary, idealized terminal device with a standard keyboard, printer, and control sequence set. Both client and server map their local physical hardware conventions into NVT representations when sending, and convert NVT representations into local hardware conventions upon receipt.
+
+\subsection{In-Band Signaling and the \texttt{IAC} Escape Mechanism}
+
+How does a protocol transmit control commands (such as ``interrupt this program'' or ``negotiate echo options'') over the exact same TCP stream used to carry normal text typed by the user?
+
+There are two architectural choices:
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Out-of-Band Signaling:} Open a second TCP connection for commands, or use TCP Urgent Pointers. This introduces complex synchronization overhead.
+    \item \textbf{In-Band Signaling (The Telnet Solution):} Inject control commands directly into the byte stream by prefixing them with a dedicated, reserved escape byte called \textbf{\texttt{IAC}} (\textbf{Interpret As Command}), which has the decimal value \textbf{255} (hexadecimal \textbf{\texttt{0xFF}}).
+\end{enumerate}
+
+When the receiving Telnet parser encounters byte \texttt{0xFF}, it immediately departs from normal text processing and interprets the subsequent byte(s) as a protocol command.
+
+\begin{beginnerconcept}[The Doubled IAC Rule]
+What happens if the user legitimately wants to send the binary byte \texttt{255} (for example, inside an image file, a compiled executable, or a UTF-8 character)?
+
+To allow arbitrary 8-bit binary transparency, Telnet mandates byte-stuffing: \textbf{if the literal value 255 must be transmitted as data, the sender must transmit two consecutive \texttt{0xFF} bytes: \texttt{[IAC, IAC]}.} 
+
+When the parser sees \texttt{0xFF 0xFF}, it consumes both bytes and emits a single literal \texttt{255} to the application.
+\end{beginnerconcept}
+
+\subsection{Anatomy of a Telnet Byte Stream}
+
+Figure~\ref{fig:byte_stream_frame} illustrates how plain text, command negotiations, escaped literals, and line-ending sequences are interleaved within a single raw TCP byte stream.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    scale=0.88, every node/.style={transform shape},
+    bcell/.style={rectangle, draw=black!80, minimum width=1.1cm, minimum height=1.1cm, align=center, font=\ttfamily\footnotesize, thick},
+    textcell/.style={bcell, fill=blue!15},
+    iaccell/.style={bcell, fill=red!25},
+    cmdcell/.style={bcell, fill=orange!25},
+    optcell/.style={bcell, fill=yellow!25},
+    subcell/.style={bcell, fill=purple!20},
+    cancell/.style={bcell, fill=gray!20},
+    note/.style={font=\scriptsize\sffamily, align=center}
+]
+
+% Byte stream matrix
+\node[textcell] (b0) at (0, 0) {'h'\\{\tiny 0x68}};
+\node[textcell, right=0.08cm of b0] (b1) {'e'\\{\tiny 0x65}};
+\node[textcell, right=0.08cm of b1] (b2) {'l'\\{\tiny 0x6C}};
+\node[textcell, right=0.08cm of b2] (b3) {'l'\\{\tiny 0x6C}};
+\node[textcell, right=0.08cm of b3] (b4) {'o'\\{\tiny 0x6F}};
+
+\node[iaccell, right=0.25cm of b4] (b5) {IAC\\{\tiny 0xFF}};
+\node[cmdcell, right=0.08cm of b5] (b6) {WILL\\{\tiny 0xFB}};
+\node[optcell, right=0.08cm of b6] (b7) {ECHO\\{\tiny 0x01}};
+
+\node[textcell, right=0.25cm of b7] (b8) {' ' \\{\tiny 0x20}};
+
+\node[iaccell, right=0.25cm of b8] (b9) {IAC\\{\tiny 0xFF}};
+\node[iaccell, right=0.08cm of b9] (b10) {IAC\\{\tiny 0xFF}};
+
+\node[cancell, right=0.25cm of b10] (b11) {'\textbackslash r'\\{\tiny 0x0D}};
+\node[cancell, right=0.08cm of b11] (b12) {NUL\\{\tiny 0x00}};
+
+% Curly braces / annotations
+\draw[thick, decoration={brace, mirror, raise=5pt}, decorate] (b0.south west) -- node[below=8pt, note] {ASCII Payload\\(\texttt{"hello"})} (b4.south east);
+
+\draw[thick, decoration={brace, mirror, raise=5pt}, decorate] (b5.south west) -- node[below=8pt, note] {Telnet Negotiation\\(Server will echo)} (b7.south east);
+
+\draw[thick, decoration={brace, mirror, raise=5pt}, decorate] (b9.south west) -- node[below=8pt, note] {Escaped 0xFF\\(Yields 1 byte data)} (b10.south east);
+
+\draw[thick, decoration={brace, mirror, raise=5pt}, decorate] (b11.south west) -- node[below=8pt, note] {NVT Line Ending\\(Bare CR $\to$ CR NUL)} (b12.south east);
+
+\end{tikzpicture}
+\caption{Anatomy of a Telnet byte stream showing plain text, negotiation, escaping, and line endings.}
+\label{fig:byte_stream_frame}
+\end{figure}
+
+\subsection{Line Endings: CR LF vs. CR NUL}
+
+In the NVT specification (RFC 854), the carriage return character (\texttt{CR}, \texttt{0x0D}) has strict semantic rules:
+\begin{itemize}[leftmargin=1.5em]
+    \item A standard newline that moves the cursor to the beginning of the next line \textbf{must} be transmitted over the network as the two-byte sequence \textbf{\texttt{CR LF}} (\texttt{0x0D 0x0A}).
+    \item A bare carriage return (moving the cursor to column 0 on the \textit{same} line without advancing down) \textbf{must} be transmitted as \textbf{\texttt{CR NUL}} (\texttt{0x0D 0x00}).
+\end{itemize}
+Because UNIX terminals expect a single line-feed character (\texttt{\textbackslash n}, \texttt{0x0A}) to perform both actions, our implementation contains dedicated normalization logic (\texttt{collapse\_crlf}) in the parser and encoder to transparently convert between local OS conventions and strict NVT wire formats.
+
+\subsection{Telnet Protocol Constants and Commands}
+
+RFC 854 defines numeric command codes residing in the upper byte range ($240$--$255$). Table~\ref{tab:telnet_commands} summarizes these commands as implemented in \texttt{include/telnet\_proto.h}.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}llcp{8.2cm}@{}}
+\toprule
+\textbf{Constant} & \textbf{Name} & \textbf{Value} & \textbf{Meaning and Operational Purpose} \\
+\midrule
+\texttt{TN\_SE}   & Subnegotiation End & 240 & Terminates a variable-length subnegotiation parameter block. \\
+\texttt{TN\_NOP}  & No Operation       & 241 & No-op; discarded by receiver (used for keep-alive). \\
+\texttt{TN\_DM}   & Data Mark          & 242 & Synchronizes data stream after urgent break. \\
+\texttt{TN\_BRK}  & Break              & 243 & Indicates NVT Break key pressed (mapped to \texttt{SIGINT} / \texttt{\^{}C}). \\
+\texttt{TN\_IP}   & Interrupt Process  & 244 & Requests graceful process interrupt (mapped to \texttt{\^{}C}). \\
+\texttt{TN\_AO}   & Abort Output       & 245 & Requests server to suppress output while process continues. \\
+\texttt{TN\_AYT}  & Are You There?     & 246 & Diagnostic probe; server must reply with visible characters (e.g., \texttt{[Yes]}). \\
+\texttt{TN\_EC}   & Erase Character    & 247 & Deletes preceding character (mapped to \texttt{0x7F} / Backspace). \\
+\texttt{TN\_EL}   & Erase Line         & 248 & Deletes current line (mapped to \texttt{0x15} / \texttt{\^{}U}). \\
+\texttt{TN\_GA}   & Go Ahead           & 249 & Signals half-duplex peer to transmit (suppressed by SGA). \\
+\texttt{TN\_SB}   & Subnegotiation Begin & 250 & Initiates option parameter payload transfer. \\
+\texttt{TN\_WILL} & Will Perform       & 251 & Sender offers or confirms willingness to enable an option. \\
+\texttt{TN\_WONT} & Won't Perform      & 252 & Sender refuses to enable or demands disabling of an option. \\
+\texttt{TN\_DO}   & Do Perform         & 253 & Sender requests or approves peer to enable an option. \\
+\texttt{TN\_DONT} & Don't Perform      & 254 & Sender demands peer disable or refrain from enabling an option. \\
+\texttt{TN\_IAC}  & Interpret As Cmd   & 255 & Prefix escape byte introducing all Telnet control sequences. \\
+\bottomrule
+\end{tabular}
+\caption{Telnet command codes defined in RFC 854.}
+\label{tab:telnet_commands}
+\end{table}
+
+\subsection{Option Negotiation: The Four-Verb Model}
+
+Basic NVT Telnet is very primitive: it runs in half-duplex mode, emits Go-Ahead signals, and expects the client to echo typed characters locally. To support modern interactive full-screen applications (like \texttt{vim}, \texttt{top}, or \texttt{bash}), the client and server must negotiate enhanced capabilities.
+
+Telnet uses an elegant, symmetric four-verb negotiation mechanism:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{\texttt{WILL opt}:} Sender says: \textit{``I want to turn on option \texttt{opt} on my side,''} or \textit{``I agree to turn on option \texttt{opt} on my side.''}
+    \item \textbf{\texttt{DO opt}:} Sender says: \textit{``I want you to turn on option \texttt{opt} on your side,''} or \textit{``I agree that you should turn it on.''}
+    \item \textbf{\texttt{WONT opt}:} Sender says: \textit{``I refuse to turn on option \texttt{opt} on my side,''} or \textit{``I am turning it off.''}
+    \item \textbf{\texttt{DONT opt}:} Sender says: \textit{``I demand you turn off option \texttt{opt} on your side,''} or \textit{``You are forbidden from enabling it.''}
+\end{itemize}
+
+Crucially, \textbf{an option is negotiated independently in each direction}. For example, option \texttt{ECHO} (Option 1) on the server's side means \textit{``The server echoes characters sent by the client.''} Option \texttt{ECHO} on the client's side would mean \textit{``The client echoes characters sent by the server''} (which makes no sense and is always refused).
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=1.8cm and 3.5cm,
+    every node/.style={font=\small\sffamily},
+    actor/.style={rectangle, draw=black, fill=gray!20, minimum width=2.5cm, minimum height=0.8cm, font=\bfseries},
+    msg/.style={-{Stealth[length=2.5mm]}, thick}
+]
+
+\node[actor] (srv) at (0, 0) {Server};
+\node[actor] (cli) at (7, 0) {Client};
+
+\draw[dashed, black!40] (srv) -- (0, -4.5);
+\draw[dashed, black!40] (cli) -- (7, -4.5);
+
+% Negotiation 1: ECHO
+\draw[msg, color=blue!70!black] (0, -1.0) -- node[above, sloped] {\texttt{IAC WILL ECHO} (I will echo your typing)} (7, -1.5);
+\draw[msg, color=blue!70!black] (7, -1.8) -- node[above, sloped] {\texttt{IAC DO ECHO} (Please do echo)} (0, -2.3);
+
+% Negotiation 2: NAWS
+\draw[msg, color=green!60!black] (0, -2.8) -- node[above, sloped] {\texttt{IAC DO NAWS} (Please report your window size)} (7, -3.3);
+\draw[msg, color=green!60!black] (7, -3.6) -- node[above, sloped] {\texttt{IAC WILL NAWS} (I agree to report window size)} (0, -4.1);
+
+\end{tikzpicture}
+\caption{Basic option negotiation handshake between Server and Client.}
+\label{fig:option_handshake}
+\end{figure}
+
+The primary Telnet options implemented in this project are:
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{ECHO (RFC 857, Option 1):} Server takes responsibility for echoing characters back to the terminal. This allows password prompts to disable echo so typed passwords remain hidden.
+    \item \textbf{Suppress Go Ahead (SGA, RFC 858, Option 3):} Eliminates the antiquated half-duplex turn-taking signal (\texttt{GA}), enabling true full-duplex interactive streaming.
+    \item \textbf{Negotiate About Window Size (NAWS, RFC 1073, Option 31):} Allows the client to inform the server of the terminal screen dimensions (columns and rows), and transmit updates whenever the user resizes the terminal emulator window.
+    \item \textbf{Terminal-Type (TTYPE, RFC 1091, Option 24):} Allows the server to query the client's terminal emulation type (such as \texttt{xterm-256color} or \texttt{vt100}) so that applications like \texttt{htop} or \texttt{nano} can format color escape sequences correctly.
+\end{enumerate}
+
+\subsection{Preventing Infinite Negotiation Loops: The RFC 1143 Q-Method}
+
+A classic hazard in naive Telnet implementations is the \textbf{negotiation loop}. Suppose Party A sends \texttt{DO ECHO}. Party B agrees and replies with \texttt{WILL ECHO}. Party A receives \texttt{WILL ECHO} and feels obligated to acknowledge it by sending \texttt{DO ECHO}. Party B receives this duplicate request and acknowledges with \texttt{WILL ECHO}. The two machines become locked in an infinite packet loop that saturates the CPU and network.
+
+In 1990, David J. Bernstein published \textbf{RFC 1143: The Q Method of Implementing TELNET Option Negotiation}. The Q-method models each side of every option as a 6-state Finite State Machine (FSM):
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{Q\_NO}: Option is disabled (stable).
+    \item \texttt{Q\_YES}: Option is enabled (stable).
+    \item \texttt{Q\_WANTNO}: We sent a disable request; waiting for peer's reply.
+    \item \texttt{Q\_WANTYES}: We sent an enable request; waiting for peer's reply.
+    \item \texttt{Q\_WANTNO\_OPP}: We sent a disable request, but the local user already requested to re-enable it as soon as the disable completes.
+    \item \texttt{Q\_WANTYES\_OPP}: We sent an enable request, but the local user already requested to cancel/disable it as soon as the enable completes.
+\end{itemize}
+By maintaining these six distinct states for both ``us'' and ``him'', an implementation can rigorously distinguish between an initial negotiation request, a confirmation reply, an unsolicited rejection, and a re-entrant state toggle, completely eliminating negotiation loops.
+
+\subsection{Subnegotiation: Complex Parameter Exchange}
+
+Some options require transferring arbitrary variable-length data rather than a simple on/off binary flag. Telnet handles this via \textbf{Subnegotiation} (\texttt{TN\_SB}):
+\begin{equation}
+\label{eq:subneg_structure}
+\texttt{[IAC, TN\_SB, OPTION\_CODE, <payload bytes...>, IAC, TN\_SE]}
+\end{equation}
+
+For example, to report an 80-column by 24-row terminal window using \textbf{NAWS (RFC 1073)}:
+\begin{itemize}[leftmargin=1.5em]
+    \item Column count 80 ($0\text{x}0050$) is encoded as two 16-bit big-endian bytes: \texttt{0x00, 0x50}.
+    \item Row count 24 ($0\text{x}0018$) is encoded as two 16-bit big-endian bytes: \texttt{0x00, 0x18}.
+    \item The complete on-the-wire subnegotiation packet is:
+    \[
+    \texttt{[0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0]}
+    \]
+\end{itemize}
+
+Similarly, for \textbf{TTYPE (RFC 1091)}:
+\begin{enumerate}[leftmargin=2em]
+    \item Server queries client: \texttt{[IAC, SB, TTYPE, 1 (SEND), IAC, SE]}
+    \item Client replies: \texttt{[IAC, SB, TTYPE, 0 (IS), 'x', 't', 'e', 'r', 'm', IAC, SE]}
+\end{enumerate}
+
+% ==============================================================================
+\section{End-to-End System Data Flow}
+% ==============================================================================
+
+To appreciate how the entire software stack functions as an organic whole, consider Figure~\ref{fig:end_to_end_flow}, which tracks the complete round-trip flow of data: from a user pressing a key on their physical keyboard, through the client terminal, across the TCP network, through the Telnet server and its Pseudoterminal (PTY), into a UNIX shell, and all the way back to the display screen.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    scale=0.88, every node/.style={transform shape},
+    box/.style={rectangle, draw=black!70, rounded corners=3pt, align=center, font=\small\sffamily, minimum height=1.0cm, minimum width=2.8cm},
+    hw/.style={box, fill=gray!25},
+    proc/.style={box, fill=blue!15},
+    codec/.style={box, fill=yellow!20},
+    net/.style={box, fill=red!15},
+    pty/.style={box, fill=purple!15},
+    sh/.style={box, fill=green!20},
+    flow/.style={-{Stealth[length=2.5mm]}, thick}
+]
+
+% Top Row: Forward Path (User -> Shell)
+\node[hw] (kbd) at (0, 5) {Keyboard\\Keystroke};
+\node[proc, right=1.0cm of kbd] (cli_tty) {Client TTY\\(Raw Mode)};
+\node[codec, right=1.0cm of cli_tty] (cli_enc) {Client\\Encoder};
+\node[net, right=1.0cm of cli_enc] (net_fwd) {TCP Socket\\(Network)};
+\node[codec, right=1.0cm of net_fwd] (srv_dec) {Server\\Parser};
+\node[pty, right=1.0cm of srv_dec] (pty_m_in) {PTY Master\\(\texttt{to\_pty})};
+\node[sh, right=1.0cm of pty_m_in] (shell) {Shell\\(\texttt{/bin/sh})};
+
+% Bottom Row: Return Path (Shell -> Display)
+\node[hw] (screen) at (0, 1.5) {Terminal\\Display};
+\node[proc, right=1.0cm of screen] (cli_out) {Client\\Stdout};
+\node[codec, right=1.0cm of cli_out] (cli_dec) {Client\\Parser};
+\node[net, right=1.0cm of cli_dec] (net_rev) {TCP Socket\\(Network)};
+\node[codec, right=1.0cm of net_rev] (srv_enc) {Server\\Encoder};
+\node[pty, right=1.0cm of srv_enc] (pty_m_out) {PTY Master\\(\texttt{to\_client})};
+
+% Arrows Forward Path
+\draw[flow] (kbd) -- node[above, font=\scriptsize] {Scancode} (cli_tty);
+\draw[flow] (cli_tty) -- node[above, font=\scriptsize] {Char} (cli_enc);
+\draw[flow] (cli_enc) -- node[above, font=\scriptsize] {Escaped} (net_fwd);
+\draw[flow] (net_fwd) -- node[above, font=\scriptsize] {Packets} (srv_dec);
+\draw[flow] (srv_dec) -- node[above, font=\scriptsize] {Event} (pty_m_in);
+\draw[flow] (pty_m_in) -- node[above, font=\scriptsize] {Slave PTY} (shell);
+
+% Downward from shell to PTY output
+\draw[flow] (shell.south) -- ++(0, -1.7) -| (pty_m_out.north);
+
+% Arrows Return Path
+\draw[flow] (pty_m_out) -- node[above, font=\scriptsize] {Output} (srv_enc);
+\draw[flow] (srv_enc) -- node[above, font=\scriptsize] {Escaped} (net_rev);
+\draw[flow] (net_rev) -- node[above, font=\scriptsize] {Packets} (cli_dec);
+\draw[flow] (cli_dec) -- node[above, font=\scriptsize] {Text} (cli_out);
+\draw[flow] (cli_out) -- node[above, font=\scriptsize] {Glyphs} (screen);
+
+\end{tikzpicture}
+\caption{End-to-end data flow: From keyboard keystroke to shell execution and back to screen display.}
+\label{fig:end_to_end_flow}
+\end{figure}
+
+With these fundamental networking principles, OS primitives, and protocol specifications firmly established, we can now embark on an exhaustive, minute line-by-line exploration of the actual C11 source code in Chapters 2 and 3.

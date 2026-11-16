@@ -1,0 +1,175 @@
+\documentclass[11pt,a4paper]{report}
+
+% ==============================================================================
+% Document Packages
+% ==============================================================================
+\usepackage[a4paper,top=2.5cm,bottom=2.5cm,left=2.5cm,right=2.5cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[most]{tcolorbox}
+\usepackage{tikz}
+
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc,backgrounds,matrix,chains,decorations.pathreplacing}
+
+% ==============================================================================
+% Hyperref Configuration
+% ==============================================================================
+\usepackage[
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=teal!70!black,
+    urlcolor=blue!80!black,
+    filecolor=purple!70!black,
+    bookmarks=true,
+    bookmarksnumbered=true,
+    pdfstartview=FitH
+]{hyperref}
+
+% ==============================================================================
+% Listings Configuration (C11 Syntax Highlighting)
+% ==============================================================================
+\definecolor{codebg}{rgb}{0.97,0.98,0.99}
+\definecolor{codeborder}{rgb}{0.85,0.88,0.92}
+\definecolor{commentgreen}{rgb}{0.20,0.55,0.30}
+\definecolor{keywordblue}{rgb}{0.10,0.30,0.70}
+\definecolor{stringred}{rgb}{0.70,0.15,0.15}
+\definecolor{numbergray}{rgb}{0.50,0.52,0.55}
+\definecolor{directiverange}{rgb}{0.50,0.20,0.70}
+
+\lstdefinestyle{telnetc}{
+    language=C,
+    backgroundcolor=\color{codebg},
+    commentstyle=\color{commentgreen}\itshape,
+    keywordstyle=\color{keywordblue}\bfseries,
+    stringstyle=\color{stringred},
+    numberstyle=\tiny\color{numbergray}\ttfamily,
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=8pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    frame=single,
+    rulecolor=\color{codeborder},
+    xleftmargin=12pt,
+    framexleftmargin=6pt,
+    columns=fullflexible,
+    morekeywords={uint8_t,uint16_t,uint32_t,uint64_t,size_t,ssize_t,pid_t,time_t,
+                  socklen_t,ring_buf,tn_parser,tn_encoder,tn_opts,session,server_config,
+                  client_config,client,tn_event,tn_q,log_level,struct,enum,bool,true,false}
+}
+
+\lstset{style=telnetc}
+
+% ==============================================================================
+% Custom Callout Boxes (tcolorbox)
+% ==============================================================================
+\newtcolorbox{beginnerconcept}[1][]{
+    enhanced,
+    colback=blue!4!white,
+    colframe=blue!65!black,
+    arc=2.5mm,
+    boxrule=1.2pt,
+    left=10pt, right=10pt, top=8pt, bottom=8pt,
+    title={\textbf{\sffamily\large\textcolor{white}{[Beginner Concept]}~~\normalsize#1}},
+    coltitle=white,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=blue!75!black, arc=1.5mm, boxrule=0.5pt},
+    breakable,
+    before skip=10pt, after skip=10pt
+}
+
+\newtcolorbox{underthehood}[1][]{
+    enhanced,
+    colback=purple!4!white,
+    colframe=purple!65!black,
+    arc=2.5mm,
+    boxrule=1.2pt,
+    left=10pt, right=10pt, top=8pt, bottom=8pt,
+    title={\textbf{\sffamily\large\textcolor{white}{[Under the Hood]}~~\normalsize#1}},
+    coltitle=white,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=purple!75!black, arc=1.5mm, boxrule=0.5pt},
+    breakable,
+    before skip=10pt, after skip=10pt
+}
+
+\newtcolorbox{commonpitfall}[1][]{
+    enhanced,
+    colback=red!4!white,
+    colframe=red!65!black,
+    arc=2.5mm,
+    boxrule=1.2pt,
+    left=10pt, right=10pt, top=8pt, bottom=8pt,
+    title={\textbf{\sffamily\large\textcolor{white}{[Common Pitfall]}~~\normalsize#1}},
+    coltitle=white,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=red!75!black, arc=1.5mm, boxrule=0.5pt},
+    breakable,
+    before skip=10pt, after skip=10pt
+}
+
+% ==============================================================================
+% Header & Footer Styling
+% ==============================================================================
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\textsl{\rightmark}}
+\fancyhead[R]{\textbf{\thepage}}
+\fancyfoot[C]{\footnotesize Engineering a Production-Grade Telnet Protocol Suite in C11}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.4pt}
+\setlength{\headheight}{14pt}
+
+% ==============================================================================
+% Document Metadata
+% ==============================================================================
+\title{
+    \vspace{-1.5cm}
+    {\huge\textbf{Building Telnet from First Principles}}\\[0.4cm]
+    {\Large\textbf{Systems Programming, Network Architecture, and Minute Source Walkthrough}}\\[0.2cm]
+    {\normalsize\textsl{A Complete Engineering Guide to RFC 854/855/1143 in Modern C11}}
+}
+\author{\textbf{Computer Networks Laboratory}}
+\date{November 2026}
+
+% ==============================================================================
+% Document Body
+% ==============================================================================
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent This book provides an exhaustive, pedagogical exploration of network systems programming through the lens of a production-grade Telnet client and server implementation written in C11. Assuming zero prior knowledge of low-level networking or operating system primitives, Chapter 1 builds all required foundational concepts from the ground up: the internet protocol suite (IPv4/IPv6), transmission control protocol (TCP), sockets as kernel file descriptors, stream fragmentation, asynchronous I/O multiplexing via \texttt{poll()}, character encodings, and the Telnet Network Virtual Terminal (NVT) protocol specification (including \texttt{IAC} control escaping, option negotiation via the RFC~1143 Q-method, and subnegotiation). 
+
+Chapters 2 and 3 provide a microscopic, line-by-line inspection of every single file in the codebase. Every data structure, ring buffer, parser state machine, pseudoterminal (\texttt{forkpty}) shell spawn, terminal raw mode manipulation (\texttt{termios}), and signal lifecycle handler is scrutinized with exact 5--20 line code excerpts accompanied by systems-level explanations, architectural diagrams, memory layouts, and failure modes. This text is prepared for direct Overleaf compilation and permanent systems reference.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ==============================================================================
+% Chapter Imports
+% ==============================================================================
+\input{ch1_fundamentals.tex}
+\newpage
+\input{ch2_server.tex}
+\newpage
+\input{ch3_client.tex}
+
+\end{document}
